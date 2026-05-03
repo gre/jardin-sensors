@@ -37,7 +37,7 @@ Connected garden, LoRa point-to-point + Home Assistant via MQTT.
 ## Layout
 
 ```
-emitter/src/main.cpp   firmware sensor node (garden)
+cuve-emitter/src/main.cpp   firmware sensor node (garden)
 gateway/src/main.cpp   firmware gateway (house): LoRa RX -> MQTT
 include/auth.h         HMAC-SHA256 + verify (header-only, shared emitter/gw)
 hardware/              wiring schematics, enclosure STLs (TODO)
@@ -47,15 +47,15 @@ secrets.example.ini    template (gitignore: secrets.ini)
 
 Shared code: `include/` with inline-only headers. PlatformIO automatically
 adds `include/` to the search path. Keep this header-only to avoid issues
-with build_src_filter (which explicitly targets `emitter/src/` or
+with build_src_filter (which explicitly targets `cuve-emitter/src/` or
 `gateway/src/` per env).
 
 ## Build
 
 ```
-pio run -e emitter
-pio run -e emitter -t upload
-pio device monitor -e emitter
+pio run -e cuve-emitter
+pio run -e cuve-emitter -t upload
+pio device monitor -e cuve-emitter
 
 pio run -e gateway
 pio run -e gateway -t upload

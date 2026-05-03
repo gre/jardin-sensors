@@ -120,7 +120,7 @@ static void oledRender(float currentDist, float currentTemp, uint32_t txSeq) {
 
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x10_tf);
-  oled.drawStr(0, 9, "Jardin emitter");
+  oled.drawStr(0, 9, "Cuve emitter");
   oled.drawStr(74, 9, loraReady ? "LoRa OK" : "LoRa ERR");
   oled.drawHLine(0, 12, 128);
 

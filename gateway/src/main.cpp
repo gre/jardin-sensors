@@ -45,7 +45,7 @@
 #define HA_DISCOVERY_PREFIX "homeassistant"
 #endif
 #ifndef HA_DEVICE_NAME
-#define HA_DEVICE_NAME "Jardin"
+#define HA_DEVICE_NAME "Cuve"
 #endif
 #ifndef HA_DEVICE_MODEL
 // Emitter model (the HA device), not the gateway.

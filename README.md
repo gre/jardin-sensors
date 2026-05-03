@@ -200,7 +200,7 @@ trivial by default. The project implements **truncated HMAC-SHA256** +
 - Emitter: `seq` field that increments on each packet (uint32_t counter since boot)
 - Gateway: `NodeState` stores `lastSeq` per node, accepts a packet only if `seq > lastSeq`
 - Emitter reboot tolerance: if `seq < 100` and `lastSeq > 10000`, we assume a reset and re-arm the counter (the "attacker replays after gateway reboot" scenario is already mitigated by the HMAC, which prevents forging)
-- Logged drops: `[gateway] replay/reorder drop node=jardin seq=42 (last=43)`
+- Logged drops: `[gateway] replay/reorder drop node=cuve seq=42 (last=43)`
 
 ### What it does NOT cover
 
@@ -229,11 +229,11 @@ homeassistant/                          (HA discovery prefix)
 └── number/jardin-gateway-<key>/config  (runtime config sliders)
 ```
 
-Example payload for `jardin/jardin/state` after augmentation by the gateway:
+Example payload for `jardin/cuve/state` after augmentation by the gateway:
 
 ```json
 {
-  "node": "jardin",
+  "node": "cuve",
   "seq": 42,
   "tank_cm": 47.3,
   "water_temp_c": 18.5,
@@ -247,7 +247,7 @@ What goes **over the air** (LoRa) before the gateway parses, validates and
 augments:
 
 ```
-{"node":"jardin","seq":42,"tank_cm":47.3,"water_temp_c":18.5}|6d17ea007dd04cf8
+{"node":"cuve","seq":42,"tank_cm":47.3,"water_temp_c":18.5}|6d17ea007dd04cf8
                                                            ^^^^^^^^^^^^^^^^^^
                                                            HMAC-SHA256 truncated (8 hex bytes)
 ```
@@ -373,7 +373,7 @@ at 0x3C and disables the display cleanly.
 
 ```
 ┌────────────────────────────┐
-│ Jardin emitter    LoRa OK  │
+│ Cuve emitter      LoRa OK  │
 │────────────────────────────│
 │                            │
 │   47.3              cm     │   ◄── ultrasonic distance (large)
@@ -397,7 +397,7 @@ at 0x3C and disables the display cleanly.
 │   87 %       18.5C         │   ◄── tank_pct (large) + temp
 │                            │
 │────────────────────────────│
-│ jardin 2s -75dBm           │   ◄── node + age last RX + RSSI
+│ cuve 2s -75dBm             │   ◄── node + age last RX + RSSI
 └────────────────────────────┘
 ```
 
@@ -457,7 +457,7 @@ packets are arriving without having to look at HA.
 ├── secrets.example.ini template to copy to secrets.ini (gitignore)
 ├── include/
 │   └── auth.h          HMAC-SHA256 + verify (header-only, shared emitter/gateway)
-├── emitter/src/        firmware sensor node (garden)
+├── cuve-emitter/src/   firmware sensor node (garden, tank ultrasonic + temp)
 ├── gateway/src/        firmware gateway (house)
 └── hardware/           wiring schematics, enclosure STLs (TODO)
 ```
@@ -476,10 +476,10 @@ openssl rand -hex 32
 
 # 3. Also edit the [wifi] and [mqtt] sections with your real credentials
 
-# Emitter
-pio run -e emitter
-pio run -e emitter -t upload
-pio device monitor -e emitter
+# Tank emitter
+pio run -e cuve-emitter
+pio run -e cuve-emitter -t upload
+pio device monitor -e cuve-emitter
 
 # Gateway (the same [lora] key must be present, otherwise packets get dropped)
 pio run -e gateway
