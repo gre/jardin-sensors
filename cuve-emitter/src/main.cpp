@@ -4,6 +4,8 @@
 #include <DallasTemperature.h>
 #include <LoRa.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
+#include <esp_sleep.h>
 #include <math.h>
 #include "auth.h"
 
@@ -17,14 +19,37 @@
 #endif
 
 #ifndef NODE_ID
-#define NODE_ID "jardin"
+#define NODE_ID "cuve"
 #endif
 
-// 1s to stay near real-time on OLED + HA. Note EU868 duty-cycle: ~50 ms
-// airtime per packet at SF7/BW125. On 868.1 MHz the regulatory limit is
-// 1% (= 1 packet/5s). We are at ~5%, OK for private indoor use.
-#ifndef TX_INTERVAL_MS
-#define TX_INTERVAL_MS 1000
+// Default TX cadence used until the gateway has pushed a value (which is then
+// persisted in NVS). EU868 reminder: ~50 ms airtime per packet at SF7/BW125,
+// regulatory limit 1% (= 1 packet/5s). Hourly cadence is fine; 1 s only OK
+// for indoor private use.
+#ifndef TX_INTERVAL_S_DEFAULT
+#define TX_INTERVAL_S_DEFAULT 60
+#endif
+
+// Bounds enforced on incoming config (must match the gateway HA slider range).
+#ifndef TX_INTERVAL_S_MIN
+#define TX_INTERVAL_S_MIN 5
+#endif
+#ifndef TX_INTERVAL_S_MAX
+#define TX_INTERVAL_S_MAX 3600
+#endif
+
+// Re-ask the gateway for config every ~1h, plus on every fresh power-up.
+#ifndef CFG_REFRESH_S
+#define CFG_REFRESH_S 3600
+#endif
+// RX window after sending a cfg_req. Gateway reply is ~250-400 ms over the air,
+// so 2 s leaves comfortable slack.
+#ifndef CFG_RX_WINDOW_MS
+#define CFG_RX_WINDOW_MS 2000
+#endif
+
+#ifndef WITH_DEEP_SLEEP
+#define WITH_DEEP_SLEEP 0
 #endif
 
 // SR04M-2 in mode 0 (TTL pulse): RX=TRIG (sensor input), TX=ECHO (output).
@@ -68,7 +93,17 @@ static U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, OLED_SCL
 static bool oledPresent = false;
 #endif
 
-static uint32_t seq = 0;
+// RTC memory survives deep sleep, resets on full power cycle. The reset is
+// what lets the gateway's "seq < 100 and lastSeq > 10000" reboot heuristic
+// re-arm the anti-replay counter.
+RTC_DATA_ATTR static uint32_t rtcSeq = 0;
+// Initialized > CFG_REFRESH_S so the very first packet after power-up carries
+// cfg_req=1 and the emitter pulls fresh settings.
+RTC_DATA_ATTR static uint32_t rtcCfgAccumS = 0xFFFFFFFFu;
+
+static Preferences prefs;
+static uint32_t txIntervalS = TX_INTERVAL_S_DEFAULT;
+
 static bool loraReady = false;
 static float lastValidDistanceCm = NAN;
 static uint32_t lastValidDistanceMs = 0;
@@ -76,6 +111,25 @@ static uint32_t lastValidDistanceMs = 0;
 static OneWire oneWire(TEMP_PIN);
 static DallasTemperature tempSensor(&oneWire);
 static bool tempReady = false;
+
+static void loadSettings() {
+  prefs.begin("emitter", true);
+  txIntervalS = prefs.getUInt("tx_int_s", TX_INTERVAL_S_DEFAULT);
+  prefs.end();
+  if (txIntervalS < TX_INTERVAL_S_MIN || txIntervalS > TX_INTERVAL_S_MAX) {
+    txIntervalS = TX_INTERVAL_S_DEFAULT;
+  }
+  Serial.printf("[emitter] settings loaded: tx_interval_s=%u\n",
+                static_cast<unsigned>(txIntervalS));
+}
+
+static void saveSettings() {
+  prefs.begin("emitter", false);
+  prefs.putUInt("tx_int_s", txIntervalS);
+  prefs.end();
+  Serial.printf("[emitter] settings saved: tx_interval_s=%u\n",
+                static_cast<unsigned>(txIntervalS));
+}
 
 static void loraInit() {
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
@@ -137,12 +191,15 @@ static void oledRender(float currentDist, float currentTemp, uint32_t txSeq) {
   if (stale) oled.drawStr(118, 9, "?");
 
   oled.drawHLine(0, 50, 128);
-  char foot[32];
+  char foot[40];
   if (isnan(currentTemp)) {
-    snprintf(foot, sizeof(foot), "TX #%lu", static_cast<unsigned long>(txSeq));
+    snprintf(foot, sizeof(foot), "TX #%lu  %us",
+             static_cast<unsigned long>(txSeq),
+             static_cast<unsigned>(txIntervalS));
   } else {
-    snprintf(foot, sizeof(foot), "TX #%lu   %.1fC",
-             static_cast<unsigned long>(txSeq), currentTemp);
+    snprintf(foot, sizeof(foot), "TX #%lu %.1fC %us",
+             static_cast<unsigned long>(txSeq), currentTemp,
+             static_cast<unsigned>(txIntervalS));
   }
   oled.drawStr(0, 62, foot);
 
@@ -193,6 +250,60 @@ static float readWaterTempC() {
   return t;
 }
 
+// Listen for a gateway config response addressed to us, echoing reqSeq.
+// Returns true if a valid, on-target ACK arrived (txIntervalS may have been
+// updated and persisted as a side effect).
+static bool tryReceiveConfig(uint32_t reqSeq) {
+  uint32_t deadline = millis() + CFG_RX_WINDOW_MS;
+  while ((int32_t)(deadline - millis()) > 0) {
+    int sz = LoRa.parsePacket();
+    if (sz <= 0) {
+      delay(5);
+      continue;
+    }
+    char buf[200];
+    int len = 0;
+    while (LoRa.available() && len < (int)sizeof(buf) - 1) {
+      buf[len++] = static_cast<char>(LoRa.read());
+    }
+    int jsonLen = authVerifyMac(buf, len,
+                                reinterpret_cast<const uint8_t*>(LORA_PSK),
+                                strlen(LORA_PSK));
+    if (jsonLen < 0) {
+      Serial.printf("[emitter] cfg RX: HMAC invalid len=%d\n", len);
+      continue;
+    }
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, buf, jsonLen);
+    if (err) continue;
+    const char* to = doc["to"] | "";
+    if (strcmp(to, NODE_ID) != 0) continue;
+    if (doc["ack"].as<uint32_t>() != reqSeq) continue;
+    if (!doc["cfg"].is<JsonObject>()) continue;
+    JsonObject cfg = doc["cfg"].as<JsonObject>();
+    bool changed = false;
+    if (cfg["tx_interval_s"].is<unsigned int>() ||
+        cfg["tx_interval_s"].is<int>()) {
+      uint32_t v = cfg["tx_interval_s"].as<uint32_t>();
+      if (v >= TX_INTERVAL_S_MIN && v <= TX_INTERVAL_S_MAX && v != txIntervalS) {
+        Serial.printf("[emitter] tx_interval_s %u -> %u\n",
+                      static_cast<unsigned>(txIntervalS),
+                      static_cast<unsigned>(v));
+        txIntervalS = v;
+        changed = true;
+      }
+    }
+    if (changed) saveSettings();
+    Serial.printf("[emitter] cfg ACK seq=%u tx_interval_s=%u\n",
+                  static_cast<unsigned>(reqSeq),
+                  static_cast<unsigned>(txIntervalS));
+    return true;
+  }
+  Serial.printf("[emitter] cfg ACK timeout for seq=%u\n",
+                static_cast<unsigned>(reqSeq));
+  return false;
+}
+
 static void sendSample() {
   float dist = readDistanceCm();
   if (!isnan(dist)) {
@@ -200,7 +311,8 @@ static void sendSample() {
     lastValidDistanceMs = millis();
   }
   float waterTemp = readWaterTempC();
-  uint32_t s = seq++;
+  uint32_t s = rtcSeq++;
+  bool wantCfg = rtcCfgAccumS >= CFG_REFRESH_S;
 
   JsonDocument doc;
   doc["node"] = NODE_ID;
@@ -215,13 +327,14 @@ static void sendSample() {
   } else {
     doc["water_temp_c"] = roundf(waterTemp * 10.0f) / 10.0f;
   }
+  if (wantCfg) doc["cfg_req"] = 1;
 
   char buf[200];
   size_t n = serializeJson(doc, buf, sizeof(buf));
   n = authAppendMac(buf, n, sizeof(buf),
                     reinterpret_cast<const uint8_t*>(LORA_PSK),
                     strlen(LORA_PSK));
-  buf[n] = '\0';  // null terminator for the printf below (LoRa.write does not need one)
+  buf[n] = '\0';
 
   if (loraReady) {
     LoRa.beginPacket();
@@ -229,15 +342,34 @@ static void sendSample() {
     LoRa.endPacket();
   }
 
-  Serial.printf("[emitter] TX seq=%lu bytes=%u lora=%d payload=%s\n",
+  Serial.printf("[emitter] TX seq=%lu cfg_req=%d bytes=%u lora=%d payload=%s\n",
                 static_cast<unsigned long>(s),
+                wantCfg ? 1 : 0,
                 static_cast<unsigned>(n),
                 loraReady ? 1 : 0,
                 buf);
 
+  if (wantCfg && loraReady) {
+    if (tryReceiveConfig(s)) {
+      rtcCfgAccumS = 0;
+    }
+    // On timeout: keep accumS over threshold so next cycle retries.
+  } else {
+    rtcCfgAccumS += txIntervalS;
+  }
+
 #if WITH_OLED
   oledRender(dist, waterTemp, s);
 #endif
+}
+
+static void enterDeepSleep() {
+  uint64_t us = static_cast<uint64_t>(txIntervalS) * 1000000ULL;
+  Serial.printf("[emitter] deep sleep %us\n",
+                static_cast<unsigned>(txIntervalS));
+  Serial.flush();
+  esp_sleep_enable_timer_wakeup(us);
+  esp_deep_sleep_start();
 }
 
 void setup() {
@@ -245,9 +377,14 @@ void setup() {
   uint32_t t0 = millis();
   while (!Serial && (millis() - t0) < 2000) {}
 
-  Serial.printf("[emitter] node=%s band=%lu Hz\n",
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  Serial.printf("[emitter] node=%s band=%lu Hz wake_cause=%d\n",
                 NODE_ID,
-                static_cast<unsigned long>(LORA_BAND));
+                static_cast<unsigned long>(LORA_BAND),
+                static_cast<int>(cause));
+
+  loadSettings();
+
 #if WITH_OLED
   oledInit();
 #endif
@@ -255,12 +392,25 @@ void setup() {
   tempInit();
   loraInit();
 #if WITH_OLED
-  oledRender(NAN, NAN, 0);
+  oledRender(NAN, NAN, rtcSeq);
 #endif
-  Serial.printf("[emitter] ready (lora=%d)\n", loraReady ? 1 : 0);
+
+  Serial.printf("[emitter] ready (lora=%d) tx_interval_s=%u\n",
+                loraReady ? 1 : 0,
+                static_cast<unsigned>(txIntervalS));
+
+#if WITH_DEEP_SLEEP
+  sendSample();
+  enterDeepSleep();
+#endif
 }
 
 void loop() {
+#if WITH_DEEP_SLEEP
+  // Unreachable: setup() ends in deep sleep, which restarts via setup().
+  enterDeepSleep();
+#else
   sendSample();
-  delay(TX_INTERVAL_MS);
+  delay(static_cast<uint32_t>(txIntervalS) * 1000UL);
+#endif
 }

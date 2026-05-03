@@ -88,8 +88,21 @@
 static_assert(TANK_EMPTY_DISTANCE_CM > TANK_FULL_DISTANCE_CM,
               "Default TANK_EMPTY_DISTANCE_CM must be > TANK_FULL_DISTANCE_CM.");
 
-static int g_tankEmptyCm = TANK_EMPTY_DISTANCE_CM;
-static int g_tankFullCm  = TANK_FULL_DISTANCE_CM;
+// Bounds enforced when an emitter receives this value. Must match
+// cuve-emitter's TX_INTERVAL_S_{MIN,MAX}.
+#ifndef CUVE_TX_INTERVAL_S_DEFAULT
+#define CUVE_TX_INTERVAL_S_DEFAULT 60
+#endif
+#ifndef CUVE_TX_INTERVAL_S_MIN
+#define CUVE_TX_INTERVAL_S_MIN 5
+#endif
+#ifndef CUVE_TX_INTERVAL_S_MAX
+#define CUVE_TX_INTERVAL_S_MAX 3600
+#endif
+
+static int g_tankEmptyCm     = TANK_EMPTY_DISTANCE_CM;
+static int g_tankFullCm      = TANK_FULL_DISTANCE_CM;
+static int g_cuveTxIntervalS = CUVE_TX_INTERVAL_S_DEFAULT;
 
 static WiFiClient wifiClient;
 static PubSubClient mqtt(wifiClient);
@@ -185,17 +198,22 @@ static void buildConfigTopic(const char* key, char* out, size_t outLen) {
   snprintf(out, outLen, "%s/config/%s", MQTT_BASE_TOPIC, key);
 }
 
-struct TankConfig {
-  const char* key;     // suffix topic
-  const char* name;    // friendly HA
-  int* target;         // ptr to global
+struct GwConfig {
+  const char* key;
+  const char* name;
+  const char* unit;
+  int min;
+  int max;
+  int* target;
 };
 
-static const TankConfig TANK_CONFIG[] = {
-  {"tank_empty_cm", "Tank empty distance", &g_tankEmptyCm},
-  {"tank_full_cm",  "Tank full distance",  &g_tankFullCm},
+static const GwConfig GW_CONFIG[] = {
+  {"tank_empty_cm",      "Tank empty distance", "cm", 0, TANK_DISTANCE_MAX_CM, &g_tankEmptyCm},
+  {"tank_full_cm",       "Tank full distance",  "cm", 0, TANK_DISTANCE_MAX_CM, &g_tankFullCm},
+  {"cuve_tx_interval_s", "Cuve TX interval",    "s",
+   CUVE_TX_INTERVAL_S_MIN, CUVE_TX_INTERVAL_S_MAX, &g_cuveTxIntervalS},
 };
-constexpr size_t TANK_CONFIG_N = sizeof(TANK_CONFIG) / sizeof(TANK_CONFIG[0]);
+constexpr size_t GW_CONFIG_N = sizeof(GW_CONFIG) / sizeof(GW_CONFIG[0]);
 
 static void mqttCallback(char* topic, byte* payload, unsigned int len) {
   char buf[16];
@@ -203,17 +221,19 @@ static void mqttCallback(char* topic, byte* payload, unsigned int len) {
   memcpy(buf, payload, len);
   buf[len] = 0;
 
-  for (size_t i = 0; i < TANK_CONFIG_N; ++i) {
+  for (size_t i = 0; i < GW_CONFIG_N; ++i) {
+    const GwConfig& c = GW_CONFIG[i];
     char expected[64];
-    buildConfigTopic(TANK_CONFIG[i].key, expected, sizeof(expected));
+    buildConfigTopic(c.key, expected, sizeof(expected));
     if (strcmp(topic, expected) != 0) continue;
     int v = atoi(buf);
-    if (v < 0 || v > TANK_DISTANCE_MAX_CM) {
-      Serial.printf("[gateway] config %s out of range: %s\n", TANK_CONFIG[i].key, buf);
+    if (v < c.min || v > c.max) {
+      Serial.printf("[gateway] config %s out of range [%d..%d]: %s\n",
+                    c.key, c.min, c.max, buf);
       return;
     }
-    *TANK_CONFIG[i].target = v;
-    Serial.printf("[gateway] config %s = %d\n", TANK_CONFIG[i].key, v);
+    *c.target = v;
+    Serial.printf("[gateway] config %s = %d\n", c.key, v);
     return;
   }
 }
@@ -354,8 +374,8 @@ static void wifiPoll() {
 }
 
 static void publishConfigDiscovery() {
-  for (size_t i = 0; i < TANK_CONFIG_N; ++i) {
-    const TankConfig& c = TANK_CONFIG[i];
+  for (size_t i = 0; i < GW_CONFIG_N; ++i) {
+    const GwConfig& c = GW_CONFIG[i];
 
     char stateTopic[64];
     buildConfigTopic(c.key, stateTopic, sizeof(stateTopic));
@@ -367,10 +387,10 @@ static void publishConfigDiscovery() {
     doc["unique_id"]           = unique;
     doc["state_topic"]         = stateTopic;
     doc["command_topic"]       = stateTopic;
-    doc["min"]                 = 0;
-    doc["max"]                 = TANK_DISTANCE_MAX_CM;
+    doc["min"]                 = c.min;
+    doc["max"]                 = c.max;
     doc["step"]                = 1;
-    doc["unit_of_measurement"] = "cm";
+    doc["unit_of_measurement"] = c.unit;
     doc["mode"]                = "box";
     doc["retain"]              = true;
     doc["entity_category"]     = "config";
@@ -507,6 +527,32 @@ static void augmentDerived(JsonDocument& doc, NodeState& st) {
   doc["tank_pct"] = constrain(pct, 0L, 100L);
 }
 
+// Reply over LoRa to an emitter that asked for fresh config (cfg_req=1).
+// The reply echoes the request's seq as `ack` so the emitter can reject any
+// replayed older response. HMAC ensures authenticity (only the holder of the
+// PSK can produce a valid MAC over this payload).
+static void sendConfigTo(const char* node, uint32_t ackSeq) {
+  JsonDocument doc;
+  doc["to"]  = node;
+  doc["ack"] = ackSeq;
+  JsonObject cfg = doc["cfg"].to<JsonObject>();
+  cfg["tx_interval_s"] = g_cuveTxIntervalS;
+
+  char buf[200];
+  size_t n = serializeJson(doc, buf, sizeof(buf));
+  n = authAppendMac(buf, n, sizeof(buf),
+                    reinterpret_cast<const uint8_t*>(LORA_PSK),
+                    strlen(LORA_PSK));
+
+  LoRa.beginPacket();
+  LoRa.write(reinterpret_cast<const uint8_t*>(buf), n);
+  LoRa.endPacket();
+
+  Serial.printf("[gateway] cfg TX to=%s ack=%u tx_interval_s=%d bytes=%u\n",
+                node, static_cast<unsigned>(ackSeq),
+                g_cuveTxIntervalS, static_cast<unsigned>(n));
+}
+
 static void publishMeasurement(const String& loraJson, int rssi, float snr) {
   if (!mqtt.connected()) return;
 
@@ -543,6 +589,13 @@ static void publishMeasurement(const String& loraJson, int rssi, float snr) {
   st->lastSeenMs = millis();
   if (!st->online && publishAvailability(node, true)) {
     st->online = true;
+  }
+
+  // cfg_req: emitter wants the latest config back. Reply over LoRa first
+  // (before MQTT publish, which can block on Wi-Fi) so the response lands
+  // inside the emitter's RX window (~2 s after its TX).
+  if (doc["cfg_req"].as<bool>()) {
+    sendConfigTo(node, incomingSeq);
   }
 
   doc["rssi"] = rssi;

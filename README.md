@@ -130,6 +130,7 @@ via MQTT retain.
 |---|---|---|---|
 | `Tank empty distance` | `jardin/config/tank_empty_cm` | 0-200 cm | sensor distance when tank is empty |
 | `Tank full distance` | `jardin/config/tank_full_cm` | 0-200 cm | sensor distance when tank is full |
+| `Cuve TX interval` | `jardin/config/cuve_tx_interval_s` | 5-3600 s | emitter packet cadence, pushed via `cfg_req` |
 
 `tank_pct = clamp(map(tank_cm, tank_empty_cm, tank_full_cm, 0, 100), 0, 100)`
 
@@ -209,6 +210,7 @@ flowchart LR
     J --> JC["config/<br/><i>runtime config, retain</i>"]
     JC --> JCE[tank_empty_cm]
     JC --> JCF[tank_full_cm]
+    JC --> JCT[cuve_tx_interval_s]
 ```
 
 Example payload for `jardin/cuve/state` after augmentation by the gateway:
@@ -410,7 +412,45 @@ packets are arriving without having to look at HA.
 - **LoRa point-to-point** (no LoRaWAN)
 - Frequency: **868.1 MHz**
 - CRC enabled
-- Short messages, ~5 s interval at first (configurable via `TX_INTERVAL_MS`)
+- TX cadence is **runtime-configurable** by the gateway (see *Runtime config sync* below); the emitter persists the chosen value in NVS
+
+### Runtime config sync (gateway → emitter)
+
+The gateway publishes a HA `number` slider per emitter (currently `Cuve TX
+interval`, range 5-3600 s). When the emitter wants the latest value, it
+appends `"cfg_req":1` to its next data packet; the gateway replies inline
+with a small config packet, the emitter saves to NVS, and the new cadence
+takes effect immediately.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant E as Cuve emitter
+    participant G as Gateway
+    participant H as Home Assistant
+    Note over E: boot or every ~1h<br/>(rtcCfgAccumS >= CFG_REFRESH_S)
+    E->>G: state packet { node, seq=N, tank_cm, ..., cfg_req:1 } + HMAC
+    G-->>H: MQTT publish (state, retain)
+    G->>E: { to:cuve, ack:N, cfg:{tx_interval_s} } + HMAC
+    Note over E: HMAC ok? to==me? ack==N?<br/>→ save NVS, use new cadence
+    H->>G: HA slider edit → MQTT retain on jardin/config/cuve_tx_interval_s
+    Note over G: g_cuveTxIntervalS updated<br/>delivered on next cfg_req
+```
+
+Properties:
+- **Authentication**: same HMAC-SHA256 + PSK as the data direction; an attacker without the key cannot forge config.
+- **Replay protection**: the emitter only accepts a response whose `ack` field matches the seq it just sent. A captured old reply cannot push stale config.
+- **Liveness**: if the gateway's reply is lost (RF, gateway down), the emitter retries on the next cycle until `rtcCfgAccumS` is reset by a successful ack.
+- **Persistence**: once acked, the value lives in NVS, so a power cycle keeps the configured cadence even if the gateway is offline at boot.
+
+### Deep sleep (battery / solar)
+
+`-DWITH_DEEP_SLEEP=1` in `[env:cuve-emitter]` switches the emitter to one-shot mode: `setup()` performs a single TX cycle (with optional `cfg_req` round-trip) then calls `esp_deep_sleep_start()` for `tx_interval_s` seconds. RTC memory preserves `seq` and the cfg-refresh accumulator across sleeps; full power cycles reset them and the gateway's reboot heuristic re-arms the anti-replay counter.
+
+Power-budget rules of thumb (LILYGO T3 V1.6.1, OLED on, no power-gating):
+- ~80 mA awake (~250 ms per cycle: sense + LoRa TX, more if cfg_req → +2 s RX window)
+- ~10 µA in deep sleep
+- At 60 s cadence: average ~0.5 mA → a 2000 mAh LiPo lasts months without charge; a small 5 W solar panel + CN3791-style MPPT covers year-round in most climates.
 
 ## Home Assistant integration
 
@@ -424,6 +464,7 @@ packets are arriving without having to look at HA.
 - **Config entities** under the "Jardin Gateway" device:
   - `Tank empty distance` (number, 0-200 cm)
   - `Tank full distance` (number, 0-200 cm)
+  - `Cuve TX interval` (number, 5-3600 s) — pushed to the emitter on its next `cfg_req` round-trip, persisted in NVS
 - **Availability**:
   - Per-node: `jardin/<node>/availability` (offline if no packet for 3 min)
   - Gateway: MQTT LWT on `jardin/gateway/availability`
@@ -497,6 +538,8 @@ LORA_PSK undefined`).
 - [x] Runtime calibration via HA `number` entities (TANK_EMPTY/FULL_DISTANCE_CM)
 - [x] "null = full" rule + 3 s debounce to avoid flicker
 - [x] **HMAC-SHA256 + anti-replay seq** on the LoRa link (auth + integrity)
+- [x] Bidirectional LoRa: emitter pulls `tx_interval_s` from gateway via `cfg_req`/ack, persists in NVS
+- [x] Deep-sleep mode for battery/solar deployment (build flag `WITH_DEEP_SLEEP=1`)
 
 ### Software (possibly later)
 - [ ] AES-128 on the LoRa payload for confidentiality (HMAC alone does not encrypt)
