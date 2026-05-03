@@ -33,16 +33,15 @@ Structural rule of the project, to follow for any new sensor added later.
 - **Why**: recalibrating the tank or changing a threshold should never
   require opening the waterproof box in the garden.
 
-```
-                EMITTER                       GATEWAY                      HOME ASSISTANT
-              ┌─────────┐                   ┌──────────┐                   ┌─────────────┐
-              │   raw   │                   │   raw    │                   │   raw +     │
-   [Sensor]───┤ values  │──── LoRa ─────────┤    +     │── MQTT (retain)──>│  derived    │
-              │  + meta │  point-to-point   │ derived  │   + discovery     │  entities   │
-              └─────────┘                   └──────────┘                   └─────────────┘
-              physical                      calibration                    automation
-              filtering                     geometry                       notifications
-              tx interval                   link tracking                  long-term storage
+```mermaid
+flowchart LR
+    Sensor((Sensor))
+    Emitter["<b>EMITTER</b><br/>raw values + meta<br/><br/><i>physical filtering<br/>tx interval</i>"]
+    Gateway["<b>GATEWAY</b><br/>raw + derived<br/><br/><i>calibration geometry<br/>link tracking</i>"]
+    HA["<b>HOME ASSISTANT</b><br/>raw + derived entities<br/><br/><i>automation<br/>notifications<br/>long-term storage</i>"]
+    Sensor --> Emitter
+    Emitter -->|"LoRa<br/>point-to-point"| Gateway
+    Gateway -->|"MQTT retain<br/>+ discovery"| HA
 ```
 
 ## Overall architecture
@@ -51,46 +50,31 @@ Both nodes run on **the same board** (LILYGO LoRa32 T3 V1.6.1); only the
 firmware differs. The role is selected by the PlatformIO env (`emitter` or
 `gateway`).
 
-```
-        [GARDEN]                              [HOUSE]
-   ┌──────────────────────────┐          ┌──────────────────────────┐
-   │  EMITTER                 │          │  GATEWAY                 │
-   │  LILYGO LoRa32 T3 V1.6.1 │  LoRa    │  LILYGO LoRa32 T3 V1.6.1 │
-   │  ──────────────────────  │ 868.1MHz │  ──────────────────────  │
-   │  • SR04M-2 -> tank_cm    │ ───────> │  • Decode JSON           │
-   │  • LoRa TX every 5s      │  ~100 m  │  • Derive tank_pct       │
-   │                          │  point-  │  • Track availability    │
-   │  "dumb sensor"           │  to-pt   │  • MQTT publish + LWT    │
-   │                          │          │  • HA auto-discovery     │
-   │                          │          │  "smart hub"             │
-   └──────────────────────────┘          └────────────┬─────────────┘
-                                                      │ Wi-Fi + MQTT
-                                                      v
-                                         ┌──────────────────────────┐
-                                         │  Home Assistant          │
-                                         │  • auto discovery        │
-                                         │  • notifications         │
-                                         │  • long-term graphs      │
-                                         └──────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph garden ["🌿 GARDEN"]
+        E["<b>EMITTER</b><br/>LILYGO LoRa32 T3 V1.6.1<br/>━━━━━━━━━━━━<br/>SR04M-2 → tank_cm<br/>DS18B20 → water_temp_c<br/>LoRa TX every 1 s<br/><br/><i>'dumb sensor'</i>"]
+    end
+    subgraph house ["🏠 HOUSE"]
+        G["<b>GATEWAY</b><br/>LILYGO LoRa32 T3 V1.6.1<br/>━━━━━━━━━━━━<br/>Verify HMAC, decode JSON<br/>Derive tank_pct<br/>Track availability<br/>MQTT publish + LWT<br/>HA auto-discovery<br/><br/><i>'smart hub'</i>"]
+        HA["<b>Home Assistant</b><br/>auto discovery<br/>notifications<br/>long-term graphs"]
+    end
+    E -->|"LoRa 868.1 MHz<br/>~100 m point-to-point"| G
+    G -->|"Wi-Fi + MQTT"| HA
 ```
 
 ## Per-measurement data flow
 
-```
-   SR04M-2 ----trig/echo----> [median 5x] -----> tank_cm (float, raw distance)
-                                                  │
-                                                  ▼  (LoRa JSON)
-                                            ┌─────────────┐
-                                            │   GATEWAY   │
-                                            │  augment:   │
-                                            │  rssi, snr  │   tank_cm still
-                                            │  tank_pct = │   published in
-                                            │   geometric │   parallel as
-                                            │   mapping   │   "diagnostic" for HA
-                                            └──────┬──────┘
-                                                   │
-                                                   ▼
-                                           tank_pct (% filled, 0..100)
+```mermaid
+flowchart TB
+    SR["SR04M-2<br/>trig / echo"] --> raw[<b>tank_cm</b><br/>float, raw distance]
+    DS["DS18B20<br/>1-Wire"] --> wt[<b>water_temp_c</b><br/>°C, factory-calibrated]
+    raw -->|"LoRa JSON<br/>+ HMAC"| GW
+    wt -->|"LoRa JSON<br/>+ HMAC"| GW
+    GW["<b>GATEWAY augment</b>"]
+    GW --> meta[+ rssi, snr]
+    GW --> pct["<b>tank_pct</b><br/>geometric mapping<br/>% filled, 0..100<br/><i>primary entity</i>"]
+    GW --> diag["<b>tank_cm</b> relayed in parallel<br/><i>diagnostic entity</i>"]
 ```
 
 ## JSON fields schema
@@ -212,21 +196,19 @@ enough.
 
 ## MQTT topics
 
-```
-homeassistant/                          (HA discovery prefix)
-└── sensor/jardin-<node>/<key>/config   (one per sensor x node)
+```mermaid
+flowchart LR
+    HA["<b>homeassistant/</b><br/><i>HA discovery prefix</i>"]
+    HA --> HAS["sensor/jardin-{node}/{key}/config<br/><i>one per sensor x emitter</i>"]
+    HA --> HAN["number/jardin-gateway/{key}/config<br/><i>runtime config sliders</i>"]
 
-jardin/                                 (MQTT_BASE_TOPIC)
-├── <node>/state                        (full JSON payload, retain=true)
-├── <node>/availability                 (online | offline, retain=true)
-├── gateway/availability                (online | offline, broker LWT)
-└── config/                             (runtime config, retain=true)
-    ├── tank_empty_cm
-    └── tank_full_cm
-
-homeassistant/                          (HA discovery prefix)
-├── sensor/jardin-<node>/<key>/config   (one per sensor x emitter)
-└── number/jardin-gateway-<key>/config  (runtime config sliders)
+    J["<b>jardin/</b><br/><i>MQTT_BASE_TOPIC</i>"]
+    J --> JS["{node}/state<br/><i>full JSON payload, retain</i>"]
+    J --> JA["{node}/availability<br/><i>online | offline, retain</i>"]
+    J --> JG["gateway/availability<br/><i>online | offline, broker LWT</i>"]
+    J --> JC["config/<br/><i>runtime config, retain</i>"]
+    JC --> JCE[tank_empty_cm]
+    JC --> JCF[tank_full_cm]
 ```
 
 Example payload for `jardin/cuve/state` after augmentation by the gateway:
@@ -257,26 +239,33 @@ over the air).
 
 ## Gateway-side node lifecycle
 
-```
-   [LoRa RX]
-       │
-       ▼
-   parse JSON ───err──> log + drop
-       │
-       ▼
-   findNode(node) ───null──> publishDiscovery() ───fail──> retry next packet
-       │                              │
-       │                              ▼
-       │                        registerNode()
-       │                              │
-       ▼                              ▼
-   markSeen ──not online──> publishAvailability("online")
-       │
-       ▼
-   augmentDerived (tank_pct)
-       │
-       ▼
-   publish <base>/<node>/state retain=true
+```mermaid
+flowchart TB
+    RX([LoRa RX])
+    HMAC{HMAC valid?}
+    PARSE{parse JSON}
+    SEQ{seq > lastSeq?<br/>or reboot heuristic}
+    FIND{node already known?}
+    DISC[publishDiscovery<br/>+ registerNode]
+    MARK[markSeen<br/>update lastSeenMs]
+    AVA{was offline?}
+    PA[publishAvailability online]
+    AUG[augmentDerived<br/>tank_pct, rssi, snr]
+    PUB[("MQTT publish<br/>jardin/{node}/state<br/>retain=true")]
+
+    RX --> HMAC
+    HMAC -- no --> D1[drop: HMAC invalid]
+    HMAC -- yes --> PARSE
+    PARSE -- err --> D2[drop: parse error]
+    PARSE -- ok --> SEQ
+    SEQ -- replay/reorder --> D3[drop]
+    SEQ -- ok --> FIND
+    FIND -- no --> DISC --> MARK
+    FIND -- yes --> MARK
+    MARK --> AVA
+    AVA -- yes --> PA --> AUG
+    AVA -- no --> AUG
+    AUG --> PUB
 ```
 
 `checkNodeTimeouts()` runs in `loop()`: any `online` node that has not sent
