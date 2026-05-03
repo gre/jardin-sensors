@@ -1,0 +1,13 @@
+secrets.ini
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+.clangd/
+.cache/
+compile_commands.json
+*.o
+*.bin
+*.elf
+*.map
+.DS_Store
