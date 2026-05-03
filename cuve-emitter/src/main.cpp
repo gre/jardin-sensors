@@ -52,6 +52,10 @@
 #define WITH_DEEP_SLEEP 0
 #endif
 
+#ifndef OLED_BOOT_DISPLAY_MS
+#define OLED_BOOT_DISPLAY_MS 10000
+#endif
+
 // SR04M-2 in mode 0 (TTL pulse): RX=TRIG (sensor input), TX=ECHO (output).
 // Datasheet: VCC 3.0-5.5V. Powered at 3.3V => echo at 3.3V => safe for ESP32.
 // Wiring: sensor RX -> ESP32 IO4 (trig out), sensor TX -> ESP32 IO25 (echo in).
@@ -374,19 +378,23 @@ static void enterDeepSleep() {
 
 void setup() {
   Serial.begin(115200);
-  uint32_t t0 = millis();
-  while (!Serial && (millis() - t0) < 2000) {}
 
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-  Serial.printf("[emitter] node=%s band=%lu Hz wake_cause=%d\n",
+  bool firstBoot = (cause == ESP_SLEEP_WAKEUP_UNDEFINED);
+  // OLED only comes alive on mains mode (always) or on a fresh boot in
+  // battery mode (RESET button = "show me data"). Skipping oledInit() on
+  // scheduled wakes leaves oledPresent=false, so oledRender no-ops naturally.
+  bool useOled = !WITH_DEEP_SLEEP || firstBoot;
+  Serial.printf("[emitter] node=%s band=%lu Hz wake_cause=%d first_boot=%d\n",
                 NODE_ID,
                 static_cast<unsigned long>(LORA_BAND),
-                static_cast<int>(cause));
+                static_cast<int>(cause),
+                firstBoot ? 1 : 0);
 
   loadSettings();
 
 #if WITH_OLED
-  oledInit();
+  if (useOled) oledInit();
 #endif
   sensorInit();
   tempInit();
@@ -395,12 +403,24 @@ void setup() {
   oledRender(NAN, NAN, rtcSeq);
 #endif
 
-  Serial.printf("[emitter] ready (lora=%d) tx_interval_s=%u\n",
+  int oledStatus = 0;
+#if WITH_OLED
+  oledStatus = oledPresent ? 1 : 0;
+#endif
+  Serial.printf("[emitter] ready (lora=%d) tx_interval_s=%u oled=%d\n",
                 loraReady ? 1 : 0,
-                static_cast<unsigned>(txIntervalS));
+                static_cast<unsigned>(txIntervalS),
+                oledStatus);
 
 #if WITH_DEEP_SLEEP
   sendSample();
+#if WITH_OLED
+  if (firstBoot && oledPresent) {
+    Serial.printf("[emitter] hold OLED %ums then sleep (press RESET to wake again)\n",
+                  static_cast<unsigned>(OLED_BOOT_DISPLAY_MS));
+    delay(OLED_BOOT_DISPLAY_MS);
+  }
+#endif
   enterDeepSleep();
 #endif
 }

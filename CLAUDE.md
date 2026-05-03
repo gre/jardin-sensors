@@ -34,6 +34,15 @@ Connected garden, LoRa point-to-point + Home Assistant via MQTT.
 - No emojis or em-dashes.
 - Do not guess APIs, versions, flags, commit SHAs, or package names. Verify by reading code or docs before asserting.
 
+## Git workflow
+
+- **Never `git commit` without asking first.** Stage and report what you're
+  about to commit, then wait for the user to say go.
+- **Never `git push` without explicit authorization for that specific push.**
+  Past authorization does not carry over to a new push.
+- Auto mode does not relax these rules; commits and pushes are exactly the
+  kind of "actions visible to others / hard to reverse" that need confirmation.
+
 ## Layout
 
 ```

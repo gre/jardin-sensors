@@ -447,6 +447,8 @@ Properties:
 
 `-DWITH_DEEP_SLEEP=1` in `[env:cuve-emitter]` switches the emitter to one-shot mode: `setup()` performs a single TX cycle (with optional `cfg_req` round-trip) then calls `esp_deep_sleep_start()` for `tx_interval_s` seconds. RTC memory preserves `seq` and the cfg-refresh accumulator across sleeps; full power cycles reset them and the gateway's reboot heuristic re-arms the anti-replay counter.
 
+The OLED stays **off** on scheduled wakes to save power. On a fresh boot (RESET button or power-up — distinguished from a timer wake via `esp_sleep_get_wakeup_cause()`), the OLED comes on for 10 s with the latest measurement, then sleeps with the rest. So **press RESET on the emitter to read the screen**: no extra hardware, no extra firmware path. Configurable via `OLED_BOOT_DISPLAY_MS`.
+
 Power-budget rules of thumb (LILYGO T3 V1.6.1, OLED on, no power-gating):
 - ~80 mA awake (~250 ms per cycle: sense + LoRa TX, more if cfg_req → +2 s RX window)
 - ~10 µA in deep sleep
