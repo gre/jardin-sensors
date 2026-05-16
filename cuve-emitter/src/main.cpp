@@ -8,6 +8,8 @@
 #include <esp_sleep.h>
 #include <math.h>
 #include "auth.h"
+#include "wdt.h"
+#include "lora_board.h"
 
 #ifndef LORA_PSK
 #error "LORA_PSK undefined: cp secrets.example.ini secrets.ini then fill in."
@@ -115,6 +117,7 @@ static uint32_t lastValidDistanceMs = 0;
 static OneWire oneWire(TEMP_PIN);
 static DallasTemperature tempSensor(&oneWire);
 static bool tempReady = false;
+static uint32_t tempRequestMs = 0;
 
 static void loadSettings() {
   prefs.begin("emitter", true);
@@ -142,7 +145,7 @@ static void loraInit() {
     Serial.println("[emitter] LoRa init failed");
     return;
   }
-  LoRa.enableCrc();
+  loraConfigureRadio();
   loraReady = true;
 }
 
@@ -237,6 +240,7 @@ static void tempInit() {
   tempSensor.setResolution(TEMP_RESOLUTION_BITS);
   tempSensor.setWaitForConversion(false);
   tempSensor.requestTemperatures();
+  tempRequestMs = millis();
   tempReady = true;
   Serial.printf("[emitter] DS18B20 ready (%d-bit)\n", TEMP_RESOLUTION_BITS);
 }
@@ -248,8 +252,10 @@ static void tempInit() {
 //   garden water, so we treat it as a read bug.
 static float readWaterTempC() {
   if (!tempReady) return NAN;
+  if ((millis() - tempRequestMs) < 400) return NAN;
   float t = tempSensor.getTempCByIndex(0);
   tempSensor.requestTemperatures();
+  tempRequestMs = millis();
   if (t == DEVICE_DISCONNECTED_C || t >= 85.0f) return NAN;
   return t;
 }
@@ -315,6 +321,7 @@ static void sendSample() {
     lastValidDistanceMs = millis();
   }
   float waterTemp = readWaterTempC();
+  float vbat = readVbatVolts();
   uint32_t s = rtcSeq++;
   bool wantCfg = rtcCfgAccumS >= CFG_REFRESH_S;
 
@@ -331,6 +338,7 @@ static void sendSample() {
   } else {
     doc["water_temp_c"] = roundf(waterTemp * 10.0f) / 10.0f;
   }
+  doc["vbat"] = roundf(vbat * 100.0f) / 100.0f;
   if (wantCfg) doc["cfg_req"] = 1;
 
   char buf[200];
@@ -340,17 +348,19 @@ static void sendSample() {
                     strlen(LORA_PSK));
   buf[n] = '\0';
 
+  bool txOk = false;
   if (loraReady) {
     LoRa.beginPacket();
     LoRa.write(reinterpret_cast<const uint8_t*>(buf), n);
-    LoRa.endPacket();
+    txOk = (LoRa.endPacket() == 1);
   }
 
-  Serial.printf("[emitter] TX seq=%lu cfg_req=%d bytes=%u lora=%d payload=%s\n",
+  Serial.printf("[emitter] TX seq=%lu cfg_req=%d bytes=%u lora=%d tx_ok=%d payload=%s\n",
                 static_cast<unsigned long>(s),
                 wantCfg ? 1 : 0,
                 static_cast<unsigned>(n),
                 loraReady ? 1 : 0,
+                txOk ? 1 : 0,
                 buf);
 
   if (wantCfg && loraReady) {
@@ -372,19 +382,19 @@ static void enterDeepSleep() {
   Serial.printf("[emitter] deep sleep %us\n",
                 static_cast<unsigned>(txIntervalS));
   Serial.flush();
+  // Park the SX1276 in STDBY before yanking power: empties FIFOs and avoids
+  // a half-finished TX leaking into the next boot's first packet.
+  if (loraReady) LoRa.sleep();
   esp_sleep_enable_timer_wakeup(us);
   esp_deep_sleep_start();
 }
 
 void setup() {
   Serial.begin(115200);
+  watchdogInit();
 
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
   bool firstBoot = (cause == ESP_SLEEP_WAKEUP_UNDEFINED);
-  // OLED only comes alive on mains mode (always) or on a fresh boot in
-  // battery mode (RESET button = "show me data"). Skipping oledInit() on
-  // scheduled wakes leaves oledPresent=false, so oledRender no-ops naturally.
-  bool useOled = !WITH_DEEP_SLEEP || firstBoot;
   Serial.printf("[emitter] node=%s band=%lu Hz wake_cause=%d first_boot=%d\n",
                 NODE_ID,
                 static_cast<unsigned long>(LORA_BAND),
@@ -394,7 +404,7 @@ void setup() {
   loadSettings();
 
 #if WITH_OLED
-  if (useOled) oledInit();
+  oledInit();
 #endif
   sensorInit();
   tempInit();
@@ -415,9 +425,7 @@ void setup() {
 #if WITH_DEEP_SLEEP
   sendSample();
 #if WITH_OLED
-  if (firstBoot && oledPresent) {
-    Serial.printf("[emitter] hold OLED %ums then sleep (press RESET to wake again)\n",
-                  static_cast<unsigned>(OLED_BOOT_DISPLAY_MS));
+  if (oledPresent) {
     delay(OLED_BOOT_DISPLAY_MS);
   }
 #endif
@@ -430,7 +438,15 @@ void loop() {
   // Unreachable: setup() ends in deep sleep, which restarts via setup().
   enterDeepSleep();
 #else
+  esp_task_wdt_reset();
   sendSample();
-  delay(static_cast<uint32_t>(txIntervalS) * 1000UL);
+  // Chunked sleep so the watchdog stays fed even at long txIntervalS.
+  uint32_t remaining = static_cast<uint32_t>(txIntervalS) * 1000UL;
+  while (remaining > 0) {
+    uint32_t chunk = remaining > 1000 ? 1000 : remaining;
+    delay(chunk);
+    esp_task_wdt_reset();
+    remaining -= chunk;
+  }
 #endif
 }
