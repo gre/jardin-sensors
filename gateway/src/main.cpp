@@ -73,7 +73,13 @@
 // Covers the case where the actuator's heartbeat is missed because the gateway
 // was still in TX when the actuator responded.
 #ifndef RELAY_CMD_RETRY_MS
-#define RELAY_CMD_RETRY_MS 8000UL
+#define RELAY_CMD_RETRY_MS 3000UL
+#endif
+// Window to drain queued MQTT relay commands before loraTx, coalescing rapid
+// bursts (e.g. relay1+relay2 from HA, or 3 toggles 100 ms apart) into a
+// single LoRa packet carrying the final desired state.
+#ifndef RELAY_BATCH_WINDOW_MS
+#define RELAY_BATCH_WINDOW_MS 250UL
 #endif
 // Debounce for "null = full tank": an isolated null in a valid stream is
 // replaced by the last known value while it is recent. A null sustained
@@ -139,6 +145,7 @@ static int g_relay1Actual = -1;  // -1 = not yet heard from the actuator
 static int g_relay2Actual = -1;
 static int g_relay1Target = -1;  // last HA-commanded state, NVS-persisted
 static int g_relay2Target = -1;
+static uint32_t g_relayTargetNvsDue = 0;  // millis() when to write target to NVS (0 = nothing pending)
 
 static WiFiClient wifiClient;
 static PubSubClient mqtt(wifiClient);
@@ -474,10 +481,7 @@ static void mqttCallback(char* topic, byte* payload, unsigned int len) {
     *k_relays[i].desired = v;
     int& target = (i == 0) ? g_relay1Target : g_relay2Target;
     target = v;
-    Preferences p;
-    p.begin("gw-relay", false);
-    p.putInt(i == 0 ? "r1t" : "r2t", v);
-    p.end();
+    g_relayTargetNvsDue = millis() + 5000;
     g_relayCommandPending = true;
     publishRelayOptimistic();
     Serial.printf("[gateway] relay %s desired=%d target=%d\n", k_relays[i].key, v, v);
@@ -955,40 +959,62 @@ void loop() {
   }
 #endif
 
+  // Process LoRa RX before relay commands so ACT confirmations are seen first.
+  // This prevents heartbeats from being lost inside a back-to-back loraTx.
+  if (loraRxFlag) {
+    loraRxFlag = false;
+    int rssi = static_cast<int>(loraRadio.getRSSI());
+    float snr = loraRadio.getSNR();
+    char rxBuf[200];
+    size_t pktLen = loraReadPacket(rxBuf, sizeof(rxBuf));
+    if (pktLen > 0) {
+      int jsonLen = authVerifyMac(rxBuf, static_cast<int>(pktLen),
+                                  reinterpret_cast<const uint8_t*>(LORA_PSK),
+                                  strlen(LORA_PSK));
+      if (jsonLen < 0) {
+        Serial.printf("[gateway] HMAC invalid, drop %u bytes rssi=%d\n",
+                      static_cast<unsigned>(pktLen), rssi);
+      } else {
+        Serial.printf("[gateway] RX rssi=%d snr=%.2f bytes=%u json=%.*s\n",
+                      rssi, snr, static_cast<unsigned>(pktLen), jsonLen, rxBuf);
+        publishMeasurement(rxBuf, static_cast<size_t>(jsonLen), rssi, snr);
+        digitalWrite(LED_PIN, HIGH);
+        delay(50);
+        ledUpdateError();
+      }
+    }
+  }
+
+  // Lazy NVS persist: write relay targets 5 s after last HA command, outside
+  // the relay send path so it never blocks back-to-back relay commands.
+  uint32_t nowMs = millis();
+  if (g_relayTargetNvsDue > 0 && nowMs >= g_relayTargetNvsDue) {
+    g_relayTargetNvsDue = 0;
+    Preferences p;
+    p.begin("gw-relay", false);
+    if (g_relay1Target >= 0) p.putInt("r1t", g_relay1Target);
+    if (g_relay2Target >= 0) p.putInt("r2t", g_relay2Target);
+    p.end();
+  }
+
   bool relayRetry = !g_relayCommandPending &&
                     (g_relay1Desired >= 0 || g_relay2Desired >= 0) &&
-                    (millis() - g_lastRelayTxMs) >= RELAY_CMD_RETRY_MS;
+                    (nowMs - g_lastRelayTxMs) >= RELAY_CMD_RETRY_MS;
   if (g_relayCommandPending || relayRetry) {
+    // Drain MQTT for RELAY_BATCH_WINDOW_MS to coalesce rapid relay commands
+    // (e.g. 3 toggles 100 ms apart) into a single LoRa packet with the final
+    // desired state, avoiding ACT heartbeat / GW loraTx collisions.
+    uint32_t drainEnd = millis() + RELAY_BATCH_WINDOW_MS;
+    do {
+      watchdogFeed();
+      mqtt.loop();
+      delay(10);
+    } while (millis() < drainEnd);
+
     g_relayCommandPending = false;
     if (relayRetry) Serial.printf("[gateway] relay retry relay1=%d relay2=%d\n",
                                   g_relay1Desired, g_relay2Desired);
     g_lastRelayTxMs = millis();
     sendRelayCommand(ACTUATOR_NODE_ID, g_relay1Desired, g_relay2Desired);
   }
-
-  if (!loraRxFlag) return;
-  loraRxFlag = false;
-
-  int rssi  = static_cast<int>(loraRadio.getRSSI());
-  float snr = loraRadio.getSNR();
-
-  char rxBuf[200];
-  size_t pktLen = loraReadPacket(rxBuf, sizeof(rxBuf));
-  if (pktLen == 0) return;
-
-  int jsonLen = authVerifyMac(rxBuf, static_cast<int>(pktLen),
-                              reinterpret_cast<const uint8_t*>(LORA_PSK),
-                              strlen(LORA_PSK));
-  if (jsonLen < 0) {
-    Serial.printf("[gateway] HMAC invalid, drop %u bytes rssi=%d\n",
-                  static_cast<unsigned>(pktLen), rssi);
-    return;
-  }
-  Serial.printf("[gateway] RX rssi=%d snr=%.2f bytes=%u json=%.*s\n",
-                rssi, snr, static_cast<unsigned>(pktLen), jsonLen, rxBuf);
-
-  publishMeasurement(rxBuf, static_cast<size_t>(jsonLen), rssi, snr);
-  digitalWrite(LED_PIN, HIGH);
-  delay(50);
-  ledUpdateError();
 }

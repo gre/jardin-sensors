@@ -261,7 +261,6 @@ static float readWaterTempC() {
 // Returns true if a valid, on-target ACK arrived (txIntervalS may have been
 // updated and persisted as a side effect).
 static bool tryReceiveConfig(uint32_t reqSeq) {
-  loraRxFlag = false;  // purge TxDone flag set by DIO0 during preceding transmit
   loraRadio.startReceive();
   uint32_t deadline = millis() + CFG_RX_WINDOW_MS;
   while ((int32_t)(deadline - millis()) > 0) {

@@ -120,10 +120,12 @@ static inline size_t loraReadPacket(char* buf, size_t bufSize) {
 static inline int16_t loraTx(const uint8_t* buf, size_t len) {
   if (loraRadio.scanChannel() == RADIOLIB_LORA_DETECTED) {
     delay(20 + static_cast<int>(random(0, 100)));
-    // Proceed even if second scan is still busy — best-effort, not blocking.
     loraRadio.scanChannel();
   }
   int16_t s = loraRadio.transmit(buf, len);
+  // Clear CadDone + TxDone spurious DIO0 flags before re-arming RX.
+  // Any real packet during CAD/TX wasn't received anyway (half-duplex).
+  loraRxFlag = false;
   loraRadio.startReceive();
   return s;
 }
