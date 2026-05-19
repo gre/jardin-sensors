@@ -69,8 +69,7 @@ static inline int16_t loraBegin() {
   // issue its own 1ms pulse against an open pin.
   loraModule.rstPin = RADIOLIB_NC;
   // PA14 doubles as DIO3 on the DX-LR30 and goes HIGH during TX, which would
-  // block SPI if RadioLib polls it as BUSY. Switch to NC so RadioLib uses
-  // internal SPI-polled delays instead.
+  // block SPI if RadioLib polls it as BUSY. Keep NC for all operations.
   loraModule.gpioPin = RADIOLIB_NC;
 #else
   loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
@@ -123,7 +122,7 @@ static inline int16_t loraTx(const uint8_t* buf, size_t len) {
     loraRadio.scanChannel();
   }
   int16_t s = loraRadio.transmit(buf, len);
-  // Clear CadDone + TxDone spurious DIO0 flags before re-arming RX.
+  // Clear CadDone + TxDone spurious DIO flags before re-arming RX.
   // Any real packet during CAD/TX wasn't received anyway (half-duplex).
   loraRxFlag = false;
   loraRadio.startReceive();

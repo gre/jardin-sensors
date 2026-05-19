@@ -70,10 +70,12 @@
 #ifndef MQTT_DOWN_REBOOT_MS
 #define MQTT_DOWN_REBOOT_MS 300000UL
 #endif
-// Covers the case where the actuator's heartbeat is missed because the gateway
-// was still in TX when the actuator responded.
+// Retry interval after an unconfirmed relay command. Must exceed the worst-case
+// LoRa round-trip: GW loraTx (~150ms) + ACT process+loraTx (~1950ms) = ~2100ms.
+// ACT loraTx is slow because SX1262 gpioPin=NC forces a 50ms fixed delay per SPI
+// command (~38 commands × 51ms). 2500ms gives ~400ms margin over the round-trip.
 #ifndef RELAY_CMD_RETRY_MS
-#define RELAY_CMD_RETRY_MS 3000UL
+#define RELAY_CMD_RETRY_MS 2500UL
 #endif
 // Window to drain queued MQTT relay commands before loraTx, coalescing commands
 // that arrive nearly simultaneously (e.g. relay1+relay2 from the same HA
