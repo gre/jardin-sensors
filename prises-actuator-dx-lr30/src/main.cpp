@@ -43,6 +43,7 @@ static uint32_t txSeq = 0;
 static int relay1State = 0;
 static int relay2State = 0;
 static uint32_t lastTxMs = 0;
+static bool g_bootRestoreSent = false;
 
 static inline int relayLevel(int state, bool activeLow) {
   return activeLow ? (state ? LOW : HIGH) : (state ? HIGH : LOW);
@@ -101,6 +102,10 @@ static void sendHeartbeat() {
   doc["relay1"] = relay1State;
   doc["relay2"] = relay2State;
   doc["vbat"]   = roundf(vbat * 100.0f) / 100.0f;
+  if (!g_bootRestoreSent) {
+    doc["restore_req"] = 1;
+    g_bootRestoreSent = true;
+  }
 
   char buf[200];
   size_t n = serializeJson(doc, buf, sizeof(buf));

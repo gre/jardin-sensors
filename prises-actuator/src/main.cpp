@@ -44,6 +44,7 @@ static bool loraReady = false;
 static uint32_t txSeq = 0;
 static int relay1State = 0;
 static int relay2State = 0;
+static bool g_bootRestoreSent = false;
 
 #if WITH_OLED
 static U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
@@ -158,6 +159,10 @@ static void sendHeartbeat() {
   doc["relay1"] = relay1State;
   doc["relay2"] = relay2State;
   doc["vbat"]   = roundf(vbat * 100.0f) / 100.0f;
+  if (!g_bootRestoreSent) {
+    doc["restore_req"] = 1;
+    g_bootRestoreSent = true;
+  }
 
   char buf[200];
   size_t n = serializeJson(doc, buf, sizeof(buf));
