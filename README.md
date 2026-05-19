@@ -127,6 +127,11 @@ Properties:
 - **State persistence**: relay state is saved to NVS (ESP32 `Preferences`) or
   EEPROM (STM32) on every change and restored at boot, so a power cycle keeps
   the last commanded state without any gateway intervention.
+- **Restore on actuator reboot**: the first heartbeat after boot carries
+  `restore_req:1`. The gateway responds by re-sending the last HA-commanded
+  state (stored in its own NVS, namespace `gw-relay`). Policy controlled by
+  `ACTUATOR_RESTORE_POLICY` in `platformio.ini`: `"restore"` (default, re-apply
+  last command) or `"off"` (send all-off for a safe, predictable restart).
 
 ### HA entities (actuator device "Prises")
 
@@ -569,6 +574,10 @@ packets are arriving without having to look at HA.
 - Frequency: **868.1 MHz**
 - CRC enabled
 - TX cadence is **runtime-configurable** by the gateway (see *Runtime config sync* below); the emitter persists the chosen value in NVS
+- **CSMA/CAD** (`loraTx()` in `lora_board.h`): every TX call runs a channel
+  activity detection scan before transmitting. If the channel is busy, a
+  random 20-120 ms backoff is applied and the scan is retried once before
+  proceeding. Prevents blind collisions when two nodes are close in time.
 
 ### Runtime config sync (gateway → emitter)
 
@@ -623,9 +632,9 @@ any new node.
 
 ### Prises actuator device
 
-- **Switch entities (primary)**: `Prise 1`, `Prise 2` — toggle from HA,
-  state reflects the actuator's confirmed relay state with optimistic
-  intermediate updates
+- **Switch entities (primary)**: `Prise 1`, `Prise 2` (`device_class: outlet`) —
+  toggle from HA, state reflects the actuator's confirmed relay state with
+  optimistic intermediate updates
 - **Diagnostic entities**: `vbat`, `rssi`, `snr`
 
 ### Jardin Gateway device (config)
@@ -735,6 +744,9 @@ LORA_PSK undefined`).
 - [x] **Relay actuator** (ESP32 + STM32/DX-LR30 variants): LoRa command/heartbeat, NVS/EEPROM persistence, per-channel polarity, HA switch entities
 - [x] Gateway optimistic relay publish + timeout retry (`RELAY_CMD_RETRY_MS=8s`) for reliable HA reactivity
 - [x] Migrated radio stack from sandeepmistry/LoRa to jgromes/RadioLib (SX1276 + SX1262 support)
+- [x] **CSMA/CAD**: `loraTx()` wrapper in `lora_board.h` — pre-TX channel scan + random backoff before every transmit across all firmwares
+- [x] **Actuator restore on reboot**: `restore_req:1` in first heartbeat; gateway re-applies last HA-commanded state (`ACTUATOR_RESTORE_POLICY`: `restore` / `off`)
+- [x] HA switch `device_class: outlet` for relay switch entities
 
 ### Software (possibly later)
 - [ ] AES-128 on the LoRa payload for confidentiality (HMAC alone does not encrypt)
