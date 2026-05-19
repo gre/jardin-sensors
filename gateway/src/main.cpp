@@ -75,11 +75,12 @@
 #ifndef RELAY_CMD_RETRY_MS
 #define RELAY_CMD_RETRY_MS 3000UL
 #endif
-// Window to drain queued MQTT relay commands before loraTx, coalescing rapid
-// bursts (e.g. relay1+relay2 from HA, or 3 toggles 100 ms apart) into a
-// single LoRa packet carrying the final desired state.
+// Window to drain queued MQTT relay commands before loraTx, coalescing commands
+// that arrive nearly simultaneously (e.g. relay1+relay2 from the same HA
+// automation) into a single LoRa packet. 50 ms captures typical broker
+// delivery jitter; longer values add visible lag for single-relay commands.
 #ifndef RELAY_BATCH_WINDOW_MS
-#define RELAY_BATCH_WINDOW_MS 250UL
+#define RELAY_BATCH_WINDOW_MS 50UL
 #endif
 // Debounce for "null = full tank": an isolated null in a valid stream is
 // replaced by the last known value while it is recent. A null sustained
