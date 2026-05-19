@@ -2,9 +2,11 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include "mbedtls/md.h"
 
 // HMAC-SHA256(key, msg) -> 32 bytes in out.
+#ifdef ESP_PLATFORM
+// mbedtls ships with Arduino-ESP32; no lib_deps entry needed.
+#include "mbedtls/md.h"
 inline void authHmacSha256(const uint8_t* key, size_t keyLen,
                            const uint8_t* msg, size_t msgLen,
                            uint8_t out[32]) {
@@ -17,6 +19,17 @@ inline void authHmacSha256(const uint8_t* key, size_t keyLen,
   mbedtls_md_hmac_finish(&ctx, out);
   mbedtls_md_free(&ctx);
 }
+#else
+#include <SHA256.h>
+inline void authHmacSha256(const uint8_t* key, size_t keyLen,
+                           const uint8_t* msg, size_t msgLen,
+                           uint8_t out[32]) {
+  SHA256 sha256;
+  sha256.resetHMAC(key, keyLen);
+  sha256.update(msg, msgLen);
+  sha256.finalizeHMAC(key, keyLen, out, 32);
+}
+#endif
 
 // Append "|" + 16 hex chars (= 8 truncated HMAC bytes) to the buffer.
 // Returns the new length. buf must have at least (currentLen + 17 + 1).

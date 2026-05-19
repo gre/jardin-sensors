@@ -1,4 +1,6 @@
 #pragma once
+
+#ifdef ESP_PLATFORM
 #include <esp_task_wdt.h>
 
 #ifndef TWDT_TIMEOUT_S
@@ -18,3 +20,10 @@ inline void watchdogInit() {
 #endif
   esp_task_wdt_add(NULL);
 }
+
+inline void watchdogFeed() { esp_task_wdt_reset(); }
+
+#else
+static inline void watchdogInit() {}
+static inline void watchdogFeed() {}
+#endif

@@ -1,8 +1,6 @@
 #include <Arduino.h>
-#include <SPI.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <LoRa.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <esp_sleep.h>
@@ -139,13 +137,12 @@ static void saveSettings() {
 }
 
 static void loraInit() {
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  if (!LoRa.begin(LORA_BAND)) {
-    Serial.println("[emitter] LoRa init failed");
+  int16_t s = loraBegin();
+  if (s != RADIOLIB_ERR_NONE) {
+    Serial.printf("[emitter] LoRa init failed: %d\n", s);
     return;
   }
-  loraConfigureRadio();
+  loraRadio.startReceive();
   loraReady = true;
 }
 
@@ -264,23 +261,24 @@ static float readWaterTempC() {
 // Returns true if a valid, on-target ACK arrived (txIntervalS may have been
 // updated and persisted as a side effect).
 static bool tryReceiveConfig(uint32_t reqSeq) {
+  loraRxFlag = false;  // purge TxDone flag set by DIO0 during preceding transmit
+  loraRadio.startReceive();
   uint32_t deadline = millis() + CFG_RX_WINDOW_MS;
   while ((int32_t)(deadline - millis()) > 0) {
-    int sz = LoRa.parsePacket();
-    if (sz <= 0) {
+    if (!loraRxFlag) {
       delay(5);
       continue;
     }
+    loraRxFlag = false;
     char buf[200];
-    int len = 0;
-    while (LoRa.available() && len < (int)sizeof(buf) - 1) {
-      buf[len++] = static_cast<char>(LoRa.read());
-    }
-    int jsonLen = authVerifyMac(buf, len,
+    size_t pktLen = loraReadPacket(buf, sizeof(buf));
+    if (pktLen == 0) continue;
+    int jsonLen = authVerifyMac(buf, static_cast<int>(pktLen),
                                 reinterpret_cast<const uint8_t*>(LORA_PSK),
                                 strlen(LORA_PSK));
     if (jsonLen < 0) {
-      Serial.printf("[emitter] cfg RX: HMAC invalid len=%d\n", len);
+      Serial.printf("[emitter] cfg RX: HMAC invalid len=%u\n",
+                    static_cast<unsigned>(pktLen));
       continue;
     }
     JsonDocument doc;
@@ -350,9 +348,8 @@ static void sendSample() {
 
   bool txOk = false;
   if (loraReady) {
-    LoRa.beginPacket();
-    LoRa.write(reinterpret_cast<const uint8_t*>(buf), n);
-    txOk = (LoRa.endPacket() == 1);
+    int16_t txState = loraRadio.transmit(reinterpret_cast<const uint8_t*>(buf), n);
+    txOk = (txState == RADIOLIB_ERR_NONE);
   }
 
   Serial.printf("[emitter] TX seq=%lu cfg_req=%d bytes=%u lora=%d tx_ok=%d payload=%s\n",
@@ -384,7 +381,7 @@ static void enterDeepSleep() {
   Serial.flush();
   // Park the SX1276 in STDBY before yanking power: empties FIFOs and avoids
   // a half-finished TX leaking into the next boot's first packet.
-  if (loraReady) LoRa.sleep();
+  if (loraReady) loraRadio.sleep();
   esp_sleep_enable_timer_wakeup(us);
   esp_deep_sleep_start();
 }
@@ -438,14 +435,14 @@ void loop() {
   // Unreachable: setup() ends in deep sleep, which restarts via setup().
   enterDeepSleep();
 #else
-  esp_task_wdt_reset();
+  watchdogFeed();
   sendSample();
   // Chunked sleep so the watchdog stays fed even at long txIntervalS.
   uint32_t remaining = static_cast<uint32_t>(txIntervalS) * 1000UL;
   while (remaining > 0) {
     uint32_t chunk = remaining > 1000 ? 1000 : remaining;
     delay(chunk);
-    esp_task_wdt_reset();
+    watchdogFeed();
     remaining -= chunk;
   }
 #endif

@@ -1,7 +1,5 @@
 #include <Arduino.h>
-#include <SPI.h>
 #include <WiFi.h>
-#include <LoRa.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
@@ -72,6 +70,11 @@
 #ifndef MQTT_DOWN_REBOOT_MS
 #define MQTT_DOWN_REBOOT_MS 300000UL
 #endif
+// Covers the case where the actuator's heartbeat is missed because the gateway
+// was still in TX when the actuator responded.
+#ifndef RELAY_CMD_RETRY_MS
+#define RELAY_CMD_RETRY_MS 8000UL
+#endif
 // Debounce for "null = full tank": an isolated null in a valid stream is
 // replaced by the last known value while it is recent. A null sustained
 // longer truly switches to 100%.
@@ -126,6 +129,9 @@ static int g_cuveTxIntervalS = CUVE_TX_INTERVAL_S_DEFAULT;
 static int g_relay1Desired = -1;
 static int g_relay2Desired = -1;
 static bool g_relayCommandPending = false;
+static uint32_t g_lastRelayTxMs = 0;
+static int g_relay1Actual = -1;  // -1 = not yet heard from the actuator
+static int g_relay2Actual = -1;
 
 static WiFiClient wifiClient;
 static PubSubClient mqtt(wifiClient);
@@ -304,9 +310,9 @@ static void sendRelayCommand(const char* node, int relay1, int relay2) {
                     reinterpret_cast<const uint8_t*>(LORA_PSK),
                     strlen(LORA_PSK));
 
-  LoRa.beginPacket();
-  LoRa.write(reinterpret_cast<const uint8_t*>(buf), n);
-  bool txOk = (LoRa.endPacket() == 1);
+  int16_t txState = loraRadio.transmit(reinterpret_cast<const uint8_t*>(buf), n);
+  bool txOk = (txState == RADIOLIB_ERR_NONE);
+  loraRadio.startReceive();
   Serial.printf("[gateway] relay cmd to=%s relay1=%d relay2=%d bytes=%u ok=%d\n",
                 node, relay1, relay2, static_cast<unsigned>(n), txOk ? 1 : 0);
 }
@@ -414,6 +420,22 @@ static bool publishActuatorDiscovery(const char* node) {
   return allOk;
 }
 
+static void publishRelayOptimistic() {
+  if (!mqtt.connected()) return;
+  int r1 = g_relay1Desired >= 0 ? g_relay1Desired : g_relay1Actual;
+  int r2 = g_relay2Desired >= 0 ? g_relay2Desired : g_relay2Actual;
+  if (r1 < 0 || r2 < 0) return;
+  JsonDocument doc;
+  doc["relay1"] = r1;
+  doc["relay2"] = r2;
+  char topic[96];
+  buildStateTopic(ACTUATOR_NODE_ID, topic, sizeof(topic));
+  char buf[64];
+  size_t n = serializeJson(doc, buf, sizeof(buf));
+  mqtt.publish(topic, reinterpret_cast<const uint8_t*>(buf), n, true);
+  Serial.printf("[gateway] relay optimistic relay1=%d relay2=%d\n", r1, r2);
+}
+
 static void mqttCallback(char* topic, byte* payload, unsigned int len) {
   char buf[16];
   if (len == 0 || len >= sizeof(buf)) return;
@@ -444,6 +466,7 @@ static void mqttCallback(char* topic, byte* payload, unsigned int len) {
     if (strcmp(topic, k_relays[i].topic) != 0) continue;
     *k_relays[i].desired = constrain(atoi(buf), 0, 1);
     g_relayCommandPending = true;
+    publishRelayOptimistic();
     Serial.printf("[gateway] relay %s desired=%d\n", k_relays[i].key, *k_relays[i].desired);
     return;
   }
@@ -481,14 +504,13 @@ static void checkNodeTimeouts() {
 }
 
 static void loraInit() {
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  if (!LoRa.begin(LORA_BAND)) {
-    Serial.println("[gateway] LoRa init failed");
+  int16_t s = loraBegin();
+  if (s != RADIOLIB_ERR_NONE) {
+    Serial.printf("[gateway] LoRa init failed: %d\n", s);
     digitalWrite(LED_PIN, HIGH);
     while (true) delay(1000);
   }
-  loraConfigureRadio();
+  loraRadio.startReceive();
 }
 
 static void wifiInit() {
@@ -719,9 +741,9 @@ static void sendConfigTo(const char* node, uint32_t ackSeq) {
                     reinterpret_cast<const uint8_t*>(LORA_PSK),
                     strlen(LORA_PSK));
 
-  LoRa.beginPacket();
-  LoRa.write(reinterpret_cast<const uint8_t*>(buf), n);
-  bool txOk = (LoRa.endPacket() == 1);
+  int16_t txState = loraRadio.transmit(reinterpret_cast<const uint8_t*>(buf), n);
+  bool txOk = (txState == RADIOLIB_ERR_NONE);
+  loraRadio.startReceive();
 
   Serial.printf("[gateway] cfg TX to=%s ack=%u tx_interval_s=%d bytes=%u tx_ok=%d\n",
                 node, static_cast<unsigned>(ackSeq),
@@ -792,13 +814,24 @@ static void publishMeasurement(const char* json, size_t jsonLen, int rssi, float
   if (!isActuator) {
     augmentDerived(doc, *st);
   } else {
-    // LoRa packet loss: re-send if the actuator echoes a stale relay state.
     int actual1 = doc["relay1"] | -1;
     int actual2 = doc["relay2"] | -1;
-    if (g_relay1Desired >= 0 && actual1 >= 0 && actual1 != g_relay1Desired)
-      g_relayCommandPending = true;
-    if (g_relay2Desired >= 0 && actual2 >= 0 && actual2 != g_relay2Desired)
-      g_relayCommandPending = true;
+    if (actual1 >= 0) g_relay1Actual = actual1;
+    if (actual2 >= 0) g_relay2Actual = actual2;
+    bool stale = false;
+    if (g_relay1Desired >= 0 && actual1 >= 0) {
+      if (actual1 != g_relay1Desired) { g_relayCommandPending = true; stale = true; }
+      else g_relay1Desired = -1;
+    }
+    if (g_relay2Desired >= 0 && actual2 >= 0) {
+      if (actual2 != g_relay2Desired) { g_relayCommandPending = true; stale = true; }
+      else g_relay2Desired = -1;
+    }
+    // Overlay desired before publishing so HA doesn't flip back while in-flight.
+    if (stale) {
+      if (g_relay1Desired >= 0) doc["relay1"] = g_relay1Desired;
+      if (g_relay2Desired >= 0) doc["relay2"] = g_relay2Desired;
+    }
   }
 
   char topic[96];
@@ -867,7 +900,7 @@ static void softWatchdog() {
 }
 
 void loop() {
-  esp_task_wdt_reset();
+  watchdogFeed();
   wifiPoll();
   mqttEnsureConnected();
   mqtt.loop();
@@ -883,32 +916,39 @@ void loop() {
   }
 #endif
 
-  if (g_relayCommandPending) {
+  bool relayRetry = !g_relayCommandPending &&
+                    (g_relay1Desired >= 0 || g_relay2Desired >= 0) &&
+                    (millis() - g_lastRelayTxMs) >= RELAY_CMD_RETRY_MS;
+  if (g_relayCommandPending || relayRetry) {
     g_relayCommandPending = false;
+    if (relayRetry) Serial.printf("[gateway] relay retry relay1=%d relay2=%d\n",
+                                  g_relay1Desired, g_relay2Desired);
+    g_lastRelayTxMs = millis();
     sendRelayCommand(ACTUATOR_NODE_ID, g_relay1Desired, g_relay2Desired);
   }
 
-  int sz = LoRa.parsePacket();
-  if (sz <= 0) return;
+  if (!loraRxFlag) return;
+  loraRxFlag = false;
 
-  String msg;
-  msg.reserve(sz);
-  while (LoRa.available()) msg += static_cast<char>(LoRa.read());
+  int rssi  = static_cast<int>(loraRadio.getRSSI());
+  float snr = loraRadio.getSNR();
 
-  int rssi  = LoRa.packetRssi();
-  float snr = LoRa.packetSnr();
+  char rxBuf[200];
+  size_t pktLen = loraReadPacket(rxBuf, sizeof(rxBuf));
+  if (pktLen == 0) return;
 
-  int jsonLen = authVerifyMac(msg.c_str(), msg.length(),
+  int jsonLen = authVerifyMac(rxBuf, static_cast<int>(pktLen),
                               reinterpret_cast<const uint8_t*>(LORA_PSK),
                               strlen(LORA_PSK));
   if (jsonLen < 0) {
-    Serial.printf("[gateway] HMAC invalid, drop %d bytes rssi=%d\n", sz, rssi);
+    Serial.printf("[gateway] HMAC invalid, drop %u bytes rssi=%d\n",
+                  static_cast<unsigned>(pktLen), rssi);
     return;
   }
-  Serial.printf("[gateway] RX rssi=%d snr=%.2f bytes=%d json=%.*s\n",
-                rssi, snr, sz, jsonLen, msg.c_str());
+  Serial.printf("[gateway] RX rssi=%d snr=%.2f bytes=%u json=%.*s\n",
+                rssi, snr, static_cast<unsigned>(pktLen), jsonLen, rxBuf);
 
-  publishMeasurement(msg.c_str(), static_cast<size_t>(jsonLen), rssi, snr);
+  publishMeasurement(rxBuf, static_cast<size_t>(jsonLen), rssi, snr);
   digitalWrite(LED_PIN, HIGH);
   delay(50);
   ledUpdateError();
