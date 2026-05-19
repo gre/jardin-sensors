@@ -123,6 +123,11 @@ static int g_cuveTxIntervalS = CUVE_TX_INTERVAL_S_DEFAULT;
 #ifndef ACTUATOR_NODE_ID
 #define ACTUATOR_NODE_ID "prises"
 #endif
+// "restore": re-send the last HA-commanded state on actuator reboot.
+// "off": send all-off on actuator reboot (safe default when unknown).
+#ifndef ACTUATOR_RESTORE_POLICY
+#define ACTUATOR_RESTORE_POLICY "restore"
+#endif
 
 // Desired relay state for the relay actuator. -1 = not yet commanded by HA
 // (avoids overriding the actuator's NVS state on gateway reboot).
@@ -830,6 +835,22 @@ static void publishMeasurement(const char* json, size_t jsonLen, int rssi, float
   if (!isActuator) {
     augmentDerived(doc, *st);
   } else {
+    if (doc["restore_req"].as<bool>()) {
+      if (strcmp(ACTUATOR_RESTORE_POLICY, "restore") == 0 &&
+          g_relay1Target >= 0 && g_relay2Target >= 0) {
+        g_relay1Desired = g_relay1Target;
+        g_relay2Desired = g_relay2Target;
+      } else {
+        g_relay1Desired = 0;
+        g_relay2Desired = 0;
+      }
+      g_relayCommandPending = true;
+      publishRelayOptimistic();
+      Serial.printf("[gateway] restore_req: policy=%s target=%d,%d desired=%d,%d\n",
+                    ACTUATOR_RESTORE_POLICY, g_relay1Target, g_relay2Target,
+                    g_relay1Desired, g_relay2Desired);
+    }
+
     int actual1 = doc["relay1"] | -1;
     int actual2 = doc["relay2"] | -1;
     if (actual1 >= 0) g_relay1Actual = actual1;
