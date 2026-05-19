@@ -34,10 +34,11 @@
 #define RELAY2_ACTIVE_LOW RELAY_ACTIVE_LOW
 #endif
 
-// EEPROM layout: 1 byte per relay, uint32_t cmd_seq at bytes 4-7.
+// EEPROM layout: 1 byte per relay, uint32_t cmd_seq at bytes 4-7, uint8_t pob at byte 8.
 #define EEPROM_RELAY1_ADDR 0
 #define EEPROM_RELAY2_ADDR 1
 #define EEPROM_CMD_SEQ_ADDR 4
+#define EEPROM_POB_ADDR 8  // power-on behavior code (uint8_t): 0=previous,1=on,2=off,3=toggle
 
 static bool loraReady = false;
 static uint32_t txSeq = 0;
@@ -46,6 +47,22 @@ static int relay2State = 0;
 static uint32_t lastTxMs = 0;
 static bool g_bootRestoreSent = false;
 static uint32_t g_lastCmdSeq = 0;
+static uint8_t g_powerOnCode = 0;  // 0=previous, 1=on, 2=off, 3=toggle
+
+static uint8_t pobEncode(const char* s) {
+  if (strcmp(s, "on") == 0)     return 1;
+  if (strcmp(s, "off") == 0)    return 2;
+  if (strcmp(s, "toggle") == 0) return 3;
+  return 0;
+}
+static const char* pobDecode(uint8_t code) {
+  switch (code) {
+    case 1: return "on";
+    case 2: return "off";
+    case 3: return "toggle";
+    default: return "previous";
+  }
+}
 
 static inline int relayLevel(int state, bool activeLow) {
   return activeLow ? (state ? LOW : HIGH) : (state ? HIGH : LOW);
@@ -82,8 +99,23 @@ static void loadRelayState() {
   relay2State = (v2 <= 1) ? static_cast<int>(v2) : 0;
   EEPROM.get(EEPROM_CMD_SEQ_ADDR, g_lastCmdSeq);
   if (g_lastCmdSeq == 0xFFFFFFFFu) g_lastCmdSeq = 0;  // unprogrammed flash
-  Serial.printf("[" NODE_ID "] relay state loaded: relay1=%d relay2=%d lastCmdSeq=%lu\n",
-                relay1State, relay2State, (unsigned long)g_lastCmdSeq);
+  uint8_t poc = EEPROM.read(EEPROM_POB_ADDR);
+  g_powerOnCode = (poc <= 3) ? poc : 0;
+
+  int r1 = relay1State, r2 = relay2State;
+  if (g_powerOnCode == 1)       { r1 = 1; r2 = 1; }         // on
+  else if (g_powerOnCode == 2)  { r1 = 0; r2 = 0; }         // off
+  else if (g_powerOnCode == 3)  { r1 ^= 1; r2 ^= 1; }       // toggle
+
+  if (r1 != relay1State || r2 != relay2State) {
+    relay1State = r1;
+    relay2State = r2;
+    EEPROM.write(EEPROM_RELAY1_ADDR, static_cast<uint8_t>(relay1State));
+    EEPROM.write(EEPROM_RELAY2_ADDR, static_cast<uint8_t>(relay2State));
+  }
+
+  Serial.printf("[" NODE_ID "] loaded: relay1=%d relay2=%d lastCmdSeq=%lu pob=%s\n",
+                relay1State, relay2State, (unsigned long)g_lastCmdSeq, pobDecode(g_powerOnCode));
 }
 
 static void loraInit() {
@@ -159,6 +191,15 @@ static void handleLoRaPacket() {
     }
     g_lastCmdSeq = cs;
     EEPROM.put(EEPROM_CMD_SEQ_ADDR, g_lastCmdSeq);
+  }
+
+  if (doc["power_on"].is<const char*>()) {
+    uint8_t newCode = pobEncode(doc["power_on"].as<const char*>());
+    if (newCode != g_powerOnCode) {
+      g_powerOnCode = newCode;
+      EEPROM.write(EEPROM_POB_ADDR, g_powerOnCode);
+      Serial.printf("[" NODE_ID "] pob updated=%s\n", pobDecode(g_powerOnCode));
+    }
   }
 
   int r1 = doc["relay1"].is<int>() ? doc["relay1"].as<int>() : relay1State;

@@ -132,11 +132,6 @@ static int g_cuveTxIntervalS = CUVE_TX_INTERVAL_S_DEFAULT;
 #ifndef ACTUATOR_NODE_ID
 #define ACTUATOR_NODE_ID "prises"
 #endif
-// "restore": re-send the last HA-commanded state on actuator reboot.
-// "off": send all-off on actuator reboot (safe default when unknown).
-#ifndef ACTUATOR_RESTORE_POLICY
-#define ACTUATOR_RESTORE_POLICY "restore"
-#endif
 
 // Desired relay state for the relay actuator. -1 = not yet commanded by HA
 // (avoids overriding the actuator's NVS state on gateway reboot).
@@ -150,6 +145,7 @@ static int g_relay1Target = -1;  // last HA-commanded state, NVS-persisted
 static int g_relay2Target = -1;
 static uint32_t g_cmdSeq = 0;    // monotonic relay command counter, NVS-persisted
 static uint32_t g_relayTargetNvsDue = 0;  // millis() when to write target to NVS (0 = nothing pending)
+static char g_powerOnBehavior[12] = "previous";  // "previous"|"on"|"off"|"toggle", NVS-persisted
 
 static WiFiClient wifiClient;
 static PubSubClient mqtt(wifiClient);
@@ -322,8 +318,9 @@ static void sendRelayCommand(const char* node, int relay1, int relay2) {
   if (relay1 >= 0) doc["relay1"] = relay1;
   if (relay2 >= 0) doc["relay2"] = relay2;
   doc["cs"] = ++g_cmdSeq;
+  doc["power_on"] = g_powerOnBehavior;
 
-  char buf[128];
+  char buf[160];
   size_t n = serializeJson(doc, buf, sizeof(buf));
   n = authAppendMac(buf, n, sizeof(buf),
                     reinterpret_cast<const uint8_t*>(LORA_PSK),
@@ -441,6 +438,43 @@ static bool publishActuatorDiscovery(const char* node) {
                   topic, static_cast<unsigned>(n), ok);
   }
   allOk &= publishSensorDiscoveries(node, HA_ACTUATOR_DEVICE_NAME, ACTUATOR_SENSORS, ACTUATOR_SENSORS_N);
+
+  {
+    JsonDocument doc;
+    doc["name"] = "Power-on behavior";
+    char unique[80];
+    snprintf(unique, sizeof(unique), "%s-power_on", nodeId);
+    doc["unique_id"] = unique;
+    char pobState[96];
+    snprintf(pobState, sizeof(pobState), "%s/" ACTUATOR_NODE_ID "/power_on/state",
+             MQTT_BASE_TOPIC);
+    doc["state_topic"] = pobState;
+    char pobCmd[96];
+    snprintf(pobCmd, sizeof(pobCmd), "%s/" ACTUATOR_NODE_ID "/power_on/set",
+             MQTT_BASE_TOPIC);
+    doc["command_topic"] = pobCmd;
+    doc["options"].add("previous");
+    doc["options"].add("on");
+    doc["options"].add("off");
+    doc["options"].add("toggle");
+    doc["entity_category"] = "config";
+
+    JsonObject device = doc["device"].to<JsonObject>();
+    device["identifiers"].add(nodeId);
+    device["name"]         = HA_ACTUATOR_DEVICE_NAME;
+    device["model"]        = HA_DEVICE_MODEL;
+    device["manufacturer"] = HA_DEVICE_MANUFACTURER;
+
+    char topic[160];
+    snprintf(topic, sizeof(topic), "%s/select/%s/config", HA_DISCOVERY_PREFIX, unique);
+
+    char buf[512];
+    size_t n = serializeJson(doc, buf, sizeof(buf));
+    bool ok = mqtt.publish(topic, reinterpret_cast<const uint8_t*>(buf), n, true);
+    allOk = allOk && ok;
+    Serial.printf("[gateway] HA actuator select %s len=%u ok=%d\n",
+                  topic, static_cast<unsigned>(n), ok);
+  }
   return allOk;
 }
 
@@ -458,6 +492,13 @@ static void publishRelayOptimistic() {
   size_t n = serializeJson(doc, buf, sizeof(buf));
   mqtt.publish(topic, reinterpret_cast<const uint8_t*>(buf), n, true);
   Serial.printf("[gateway] relay optimistic relay1=%d relay2=%d\n", r1, r2);
+}
+
+static void publishPowerOnState() {
+  if (!mqtt.connected()) return;
+  char topic[96];
+  snprintf(topic, sizeof(topic), "%s/" ACTUATOR_NODE_ID "/power_on/state", MQTT_BASE_TOPIC);
+  mqtt.publish(topic, g_powerOnBehavior, true);
 }
 
 static void mqttCallback(char* topic, byte* payload, unsigned int len) {
@@ -496,6 +537,25 @@ static void mqttCallback(char* topic, byte* payload, unsigned int len) {
     g_relayCommandPending = true;
     publishRelayOptimistic();
     Serial.printf("[gateway] relay %s desired=%d target=%d\n", k_relays[i].key, v, v);
+    return;
+  }
+
+  char pobSetTopic[96];
+  snprintf(pobSetTopic, sizeof(pobSetTopic),
+           "%s/" ACTUATOR_NODE_ID "/power_on/set", MQTT_BASE_TOPIC);
+  if (strcmp(topic, pobSetTopic) == 0) {
+    if (strcmp(buf, "previous") == 0 || strcmp(buf, "on") == 0 ||
+        strcmp(buf, "off") == 0 || strcmp(buf, "toggle") == 0) {
+      strncpy(g_powerOnBehavior, buf, sizeof(g_powerOnBehavior) - 1);
+      g_powerOnBehavior[sizeof(g_powerOnBehavior) - 1] = 0;
+      Preferences p;
+      p.begin("gw-sec", false);
+      p.putString("pob", g_powerOnBehavior);
+      p.end();
+      publishPowerOnState();
+      g_relayCommandPending = true;
+      Serial.printf("[gateway] power_on set=%s\n", g_powerOnBehavior);
+    }
     return;
   }
 }
@@ -704,6 +764,21 @@ static void loadCmdSeq() {
   Serial.printf("[gateway] cmdSeq loaded: %lu\n", (unsigned long)g_cmdSeq);
 }
 
+static void loadPowerOnBehavior() {
+  Preferences p;
+  p.begin("gw-sec", true);
+  size_t n = p.getString("pob", g_powerOnBehavior, sizeof(g_powerOnBehavior));
+  p.end();
+  if (n == 0 ||
+      (strcmp(g_powerOnBehavior, "previous") != 0 &&
+       strcmp(g_powerOnBehavior, "on") != 0 &&
+       strcmp(g_powerOnBehavior, "off") != 0 &&
+       strcmp(g_powerOnBehavior, "toggle") != 0)) {
+    strcpy(g_powerOnBehavior, "previous");
+  }
+  Serial.printf("[gateway] powerOnBehavior=%s\n", g_powerOnBehavior);
+}
+
 static void mqttInit() {
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(mqttCallback);
@@ -735,6 +810,7 @@ static void mqttEnsureConnected() {
     mqtt.subscribe(sub);
     mqtt.subscribe(MQTT_BASE_TOPIC "/" ACTUATOR_NODE_ID "/+/set");
     publishConfigDiscovery();
+    publishPowerOnState();
     Serial.printf("[gateway] MQTT connected to %s:%d, subscribed %s\n",
                   MQTT_HOST, MQTT_PORT, sub);
   } else {
@@ -860,18 +936,26 @@ static void publishMeasurement(const char* json, size_t jsonLen, int rssi, float
     augmentDerived(doc, *st);
   } else {
     if (doc["restore_req"].as<bool>()) {
-      if (strcmp(ACTUATOR_RESTORE_POLICY, "restore") == 0 &&
-          g_relay1Target >= 0 && g_relay2Target >= 0) {
-        g_relay1Desired = g_relay1Target;
-        g_relay2Desired = g_relay2Target;
-      } else {
+      if (strcmp(g_powerOnBehavior, "on") == 0) {
+        g_relay1Desired = 1;
+        g_relay2Desired = 1;
+        g_relayCommandPending = true;
+        publishRelayOptimistic();
+      } else if (strcmp(g_powerOnBehavior, "off") == 0) {
         g_relay1Desired = 0;
         g_relay2Desired = 0;
+        g_relayCommandPending = true;
+        publishRelayOptimistic();
+      } else if (strcmp(g_powerOnBehavior, "previous") == 0 &&
+                 g_relay1Target >= 0 && g_relay2Target >= 0) {
+        g_relay1Desired = g_relay1Target;
+        g_relay2Desired = g_relay2Target;
+        g_relayCommandPending = true;
+        publishRelayOptimistic();
       }
-      g_relayCommandPending = true;
-      publishRelayOptimistic();
-      Serial.printf("[gateway] restore_req: policy=%s target=%d,%d desired=%d,%d\n",
-                    ACTUATOR_RESTORE_POLICY, g_relay1Target, g_relay2Target,
+      // "toggle": actuator handles it locally; gateway observes the result
+      Serial.printf("[gateway] restore_req pob=%s target=%d,%d desired=%d,%d\n",
+                    g_powerOnBehavior, g_relay1Target, g_relay2Target,
                     g_relay1Desired, g_relay2Desired);
     }
 
@@ -918,6 +1002,7 @@ void setup() {
   watchdogInit();
   loadRelayTarget();
   loadCmdSeq();
+  loadPowerOnBehavior();
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
   Serial.printf("[gateway] band=%lu Hz\n",

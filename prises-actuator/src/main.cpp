@@ -46,6 +46,7 @@ static int relay1State = 0;
 static int relay2State = 0;
 static bool g_bootRestoreSent = false;
 static uint32_t g_lastCmdSeq = 0;
+static char g_powerOnBehavior[12] = "previous";
 
 #if WITH_OLED
 static U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
@@ -91,9 +92,32 @@ static void loadRelayState() {
   relay1State = constrain(prefs.getInt("r1", 0), 0, 1);
   relay2State = constrain(prefs.getInt("r2", 0), 0, 1);
   g_lastCmdSeq = prefs.getUInt("cs", 0);
+  size_t n = prefs.getString("pob", g_powerOnBehavior, sizeof(g_powerOnBehavior));
   prefs.end();
-  Serial.printf("[" NODE_ID "] relay state loaded: relay1=%d relay2=%d lastCmdSeq=%lu\n",
-                relay1State, relay2State, (unsigned long)g_lastCmdSeq);
+  if (n == 0 ||
+      (strcmp(g_powerOnBehavior, "previous") != 0 &&
+       strcmp(g_powerOnBehavior, "on") != 0 &&
+       strcmp(g_powerOnBehavior, "off") != 0 &&
+       strcmp(g_powerOnBehavior, "toggle") != 0)) {
+    strcpy(g_powerOnBehavior, "previous");
+  }
+
+  int r1 = relay1State, r2 = relay2State;
+  if (strcmp(g_powerOnBehavior, "on") == 0)       { r1 = 1; r2 = 1; }
+  else if (strcmp(g_powerOnBehavior, "off") == 0)  { r1 = 0; r2 = 0; }
+  else if (strcmp(g_powerOnBehavior, "toggle") == 0) { r1 ^= 1; r2 ^= 1; }
+
+  if (r1 != relay1State || r2 != relay2State) {
+    relay1State = r1;
+    relay2State = r2;
+    prefs.begin(NODE_ID, false);
+    prefs.putInt("r1", relay1State);
+    prefs.putInt("r2", relay2State);
+    prefs.end();
+  }
+
+  Serial.printf("[" NODE_ID "] relay state loaded: relay1=%d relay2=%d lastCmdSeq=%lu pob=%s\n",
+                relay1State, relay2State, (unsigned long)g_lastCmdSeq, g_powerOnBehavior);
 }
 
 static void loraInit() {
@@ -216,6 +240,20 @@ static void handleLoRaPacket() {
     prefs.begin(NODE_ID, false);
     prefs.putUInt("cs", g_lastCmdSeq);
     prefs.end();
+  }
+
+  if (doc["power_on"].is<const char*>()) {
+    const char* pob = doc["power_on"].as<const char*>();
+    if ((strcmp(pob, "previous") == 0 || strcmp(pob, "on") == 0 ||
+         strcmp(pob, "off") == 0 || strcmp(pob, "toggle") == 0) &&
+        strcmp(pob, g_powerOnBehavior) != 0) {
+      strncpy(g_powerOnBehavior, pob, sizeof(g_powerOnBehavior) - 1);
+      g_powerOnBehavior[sizeof(g_powerOnBehavior) - 1] = 0;
+      prefs.begin(NODE_ID, false);
+      prefs.putString("pob", g_powerOnBehavior);
+      prefs.end();
+      Serial.printf("[" NODE_ID "] pob updated=%s\n", g_powerOnBehavior);
+    }
   }
 
   int r1 = doc["relay1"].is<int>() ? doc["relay1"].as<int>() : relay1State;
