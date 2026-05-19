@@ -122,7 +122,7 @@ static_assert(TANK_EMPTY_DISTANCE_CM > TANK_FULL_DISTANCE_CM,
 // Worst case after a gateway crash: an attacker can replay up to (this many)
 // past packets within their freshness window. 25 @ 60-s cadence = 25 min.
 #ifndef SEQ_PERSIST_EVERY
-#define SEQ_PERSIST_EVERY 25
+#define SEQ_PERSIST_EVERY 5
 #endif
 
 static int g_tankEmptyCm     = TANK_EMPTY_DISTANCE_CM;
@@ -148,6 +148,7 @@ static int g_relay1Actual = -1;  // -1 = not yet heard from the actuator
 static int g_relay2Actual = -1;
 static int g_relay1Target = -1;  // last HA-commanded state, NVS-persisted
 static int g_relay2Target = -1;
+static uint32_t g_cmdSeq = 0;    // monotonic relay command counter, NVS-persisted
 static uint32_t g_relayTargetNvsDue = 0;  // millis() when to write target to NVS (0 = nothing pending)
 
 static WiFiClient wifiClient;
@@ -320,6 +321,7 @@ static void sendRelayCommand(const char* node, int relay1, int relay2) {
   doc["to"] = node;
   if (relay1 >= 0) doc["relay1"] = relay1;
   if (relay2 >= 0) doc["relay2"] = relay2;
+  doc["cs"] = ++g_cmdSeq;
 
   char buf[128];
   size_t n = serializeJson(doc, buf, sizeof(buf));
@@ -328,8 +330,14 @@ static void sendRelayCommand(const char* node, int relay1, int relay2) {
                     strlen(LORA_PSK));
 
   bool txOk = (loraTx(reinterpret_cast<const uint8_t*>(buf), n) == RADIOLIB_ERR_NONE);
-  Serial.printf("[gateway] relay cmd to=%s relay1=%d relay2=%d bytes=%u ok=%d\n",
-                node, relay1, relay2, static_cast<unsigned>(n), txOk ? 1 : 0);
+  Serial.printf("[gateway] relay cmd to=%s relay1=%d relay2=%d cs=%lu bytes=%u ok=%d\n",
+                node, relay1, relay2, (unsigned long)g_cmdSeq,
+                static_cast<unsigned>(n), txOk ? 1 : 0);
+
+  Preferences p;
+  p.begin("gw-sec", false);
+  p.putUInt("cs", g_cmdSeq);
+  p.end();
 }
 
 static bool publishSensorDiscoveries(const char* node, const char* deviceName,
@@ -688,6 +696,14 @@ static void loadRelayTarget() {
   Serial.printf("[gateway] relay target loaded: r1=%d r2=%d\n", g_relay1Target, g_relay2Target);
 }
 
+static void loadCmdSeq() {
+  Preferences p;
+  p.begin("gw-sec", true);
+  g_cmdSeq = p.getUInt("cs", 0);
+  p.end();
+  Serial.printf("[gateway] cmdSeq loaded: %lu\n", (unsigned long)g_cmdSeq);
+}
+
 static void mqttInit() {
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(mqttCallback);
@@ -901,6 +917,7 @@ void setup() {
 
   watchdogInit();
   loadRelayTarget();
+  loadCmdSeq();
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
   Serial.printf("[gateway] band=%lu Hz\n",

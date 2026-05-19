@@ -45,6 +45,7 @@ static uint32_t txSeq = 0;
 static int relay1State = 0;
 static int relay2State = 0;
 static bool g_bootRestoreSent = false;
+static uint32_t g_lastCmdSeq = 0;
 
 #if WITH_OLED
 static U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
@@ -89,9 +90,10 @@ static void loadRelayState() {
   prefs.begin(NODE_ID, true);
   relay1State = constrain(prefs.getInt("r1", 0), 0, 1);
   relay2State = constrain(prefs.getInt("r2", 0), 0, 1);
+  g_lastCmdSeq = prefs.getUInt("cs", 0);
   prefs.end();
-  Serial.printf("[" NODE_ID "] relay state loaded: relay1=%d relay2=%d\n",
-                relay1State, relay2State);
+  Serial.printf("[" NODE_ID "] relay state loaded: relay1=%d relay2=%d lastCmdSeq=%lu\n",
+                relay1State, relay2State, (unsigned long)g_lastCmdSeq);
 }
 
 static void loraInit() {
@@ -202,6 +204,19 @@ static void handleLoRaPacket() {
 
   const char* to = doc["to"] | "";
   if (strcmp(to, NODE_ID) != 0) return;
+
+  if (doc["cs"].is<uint32_t>()) {
+    uint32_t cs = doc["cs"].as<uint32_t>();
+    if (cs <= g_lastCmdSeq) {
+      Serial.printf("[" NODE_ID "] replay drop cs=%lu last=%lu\n",
+                    (unsigned long)cs, (unsigned long)g_lastCmdSeq);
+      return;
+    }
+    g_lastCmdSeq = cs;
+    prefs.begin(NODE_ID, false);
+    prefs.putUInt("cs", g_lastCmdSeq);
+    prefs.end();
+  }
 
   int r1 = doc["relay1"].is<int>() ? doc["relay1"].as<int>() : relay1State;
   int r2 = doc["relay2"].is<int>() ? doc["relay2"].as<int>() : relay2State;
