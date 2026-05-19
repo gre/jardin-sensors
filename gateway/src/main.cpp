@@ -132,6 +132,8 @@ static bool g_relayCommandPending = false;
 static uint32_t g_lastRelayTxMs = 0;
 static int g_relay1Actual = -1;  // -1 = not yet heard from the actuator
 static int g_relay2Actual = -1;
+static int g_relay1Target = -1;  // last HA-commanded state, NVS-persisted
+static int g_relay2Target = -1;
 
 static WiFiClient wifiClient;
 static PubSubClient mqtt(wifiClient);
@@ -462,10 +464,17 @@ static void mqttCallback(char* topic, byte* payload, unsigned int len) {
   };
   for (size_t i = 0; i < sizeof(k_relays) / sizeof(k_relays[0]); ++i) {
     if (strcmp(topic, k_relays[i].topic) != 0) continue;
-    *k_relays[i].desired = constrain(atoi(buf), 0, 1);
+    int v = constrain(atoi(buf), 0, 1);
+    *k_relays[i].desired = v;
+    int& target = (i == 0) ? g_relay1Target : g_relay2Target;
+    target = v;
+    Preferences p;
+    p.begin("gw-relay", false);
+    p.putInt(i == 0 ? "r1t" : "r2t", v);
+    p.end();
     g_relayCommandPending = true;
     publishRelayOptimistic();
-    Serial.printf("[gateway] relay %s desired=%d\n", k_relays[i].key, *k_relays[i].desired);
+    Serial.printf("[gateway] relay %s desired=%d target=%d\n", k_relays[i].key, v, v);
     return;
   }
 }
@@ -653,6 +662,17 @@ static void publishConfigDiscovery() {
     Serial.printf("[gateway] HA cfg %s len=%u ok=%d\n",
                   topic, static_cast<unsigned>(n), ok);
   }
+}
+
+static void loadRelayTarget() {
+  Preferences p;
+  p.begin("gw-relay", true);
+  int v1 = p.getInt("r1t", -1);
+  int v2 = p.getInt("r2t", -1);
+  p.end();
+  if (v1 >= 0 && v1 <= 1) g_relay1Target = v1;
+  if (v2 >= 0 && v2 <= 1) g_relay2Target = v2;
+  Serial.printf("[gateway] relay target loaded: r1=%d r2=%d\n", g_relay1Target, g_relay2Target);
 }
 
 static void mqttInit() {
@@ -851,6 +871,7 @@ void setup() {
   while (!Serial && (millis() - t0) < 2000) {}
 
   watchdogInit();
+  loadRelayTarget();
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
   Serial.printf("[gateway] band=%lu Hz\n",
