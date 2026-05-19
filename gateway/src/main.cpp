@@ -146,6 +146,7 @@ static int g_relay2Target = -1;
 static uint32_t g_cmdSeq = 0;    // monotonic relay command counter, NVS-persisted
 static uint32_t g_relayTargetNvsDue = 0;  // millis() when to write target to NVS (0 = nothing pending)
 static char g_powerOnBehavior[12] = "previous";  // "previous"|"on"|"off"|"toggle", NVS-persisted
+static uint8_t g_relayRetryCount = 0;
 
 static WiFiClient wifiClient;
 static PubSubClient mqtt(wifiClient);
@@ -215,6 +216,7 @@ struct NodeState {
   String name;
   uint32_t lastSeenMs;
   bool online;
+  bool isActuator;
   float lastValidTankCm;     // NAN until we have ever seen a valid measurement
   uint32_t lastValidTankCmMs;
   bool seenSeq;
@@ -251,6 +253,7 @@ static NodeState* registerNode(const char* name) {
   n.name = name;
   n.lastSeenMs = millis();
   n.online = false;
+  n.isActuator = (strcmp(name, ACTUATOR_NODE_ID) == 0);
   n.lastValidTankCm = NAN;
   n.lastValidTankCmMs = 0;
 
@@ -651,14 +654,20 @@ static void oledRender() {
     oled.drawStr(8, 44, num);
   }
   oled.setFont(u8g2_font_6x10_tf);
-  if (lastTankPct >= 0) oled.drawStr(72, 44, "%");
+  if (lastTankPct >= 0) oled.drawStr(65, 44, "%");
 
-  // Small temperature on the right if available
+  // Right column: temperature + relay state
+  char rc[8];
   if (!isnan(lastWaterTempC)) {
-    char tmp[12];
-    snprintf(tmp, sizeof(tmp), "%.1fC", lastWaterTempC);
-    oled.drawStr(86, 36, tmp);
+    snprintf(rc, sizeof(rc), "%.1fC", lastWaterTempC);
+    oled.drawStr(76, 22, rc);
   }
+  snprintf(rc, sizeof(rc), "P1:%s",
+           g_relay1Actual < 0 ? "--" : (g_relay1Actual ? "ON" : "OF"));
+  oled.drawStr(76, 34, rc);
+  snprintf(rc, sizeof(rc), "P2:%s",
+           g_relay2Actual < 0 ? "--" : (g_relay2Actual ? "ON" : "OF"));
+  oled.drawStr(76, 46, rc);
 
   // Footer: node name + age + RSSI
   oled.drawHLine(0, 50, 128);
@@ -779,6 +788,10 @@ static void loadPowerOnBehavior() {
   Serial.printf("[gateway] powerOnBehavior=%s\n", g_powerOnBehavior);
 }
 
+static bool publishDiscovery(const char* node) {
+  return publishSensorDiscoveries(node, HA_DEVICE_NAME, HA_SENSORS, HA_SENSORS_N);
+}
+
 static void mqttInit() {
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(mqttCallback);
@@ -811,6 +824,19 @@ static void mqttEnsureConnected() {
     mqtt.subscribe(MQTT_BASE_TOPIC "/" ACTUATOR_NODE_ID "/+/set");
     publishConfigDiscovery();
     publishPowerOnState();
+    // Re-publish discovery + availability for nodes already seen this session
+    // so HA recovers immediately after a broker restart without waiting for the
+    // next heartbeat.
+    for (uint8_t i = 0; i < nodesCount; ++i) {
+      const char* name = nodes[i].name.c_str();
+      if (nodes[i].isActuator) {
+        publishActuatorDiscovery(name);
+      } else {
+        publishDiscovery(name);
+      }
+      publishAvailability(name, nodes[i].online);
+    }
+    publishRelayOptimistic();
     Serial.printf("[gateway] MQTT connected to %s:%d, subscribed %s\n",
                   MQTT_HOST, MQTT_PORT, sub);
   } else {
@@ -819,10 +845,6 @@ static void mqttEnsureConnected() {
                   static_cast<unsigned long>(MQTT_RECONNECT_BACKOFF_MS));
     nextAttempt = millis() + MQTT_RECONNECT_BACKOFF_MS;
   }
-}
-
-static bool publishDiscovery(const char* node) {
-  return publishSensorDiscoveries(node, HA_DEVICE_NAME, HA_SENSORS, HA_SENSORS_N);
 }
 
 static void augmentDerived(JsonDocument& doc, NodeState& st) {
@@ -972,6 +994,10 @@ static void publishMeasurement(const char* json, size_t jsonLen, int rssi, float
       if (actual2 != g_relay2Desired) { g_relayCommandPending = true; stale = true; }
       else g_relay2Desired = -1;
     }
+    if (g_relay1Desired < 0 && g_relay2Desired < 0 && g_relayRetryCount > 0) {
+      Serial.printf("[gateway] relay confirmed after %u retries\n", g_relayRetryCount);
+      g_relayRetryCount = 0;
+    }
     // Overlay desired before publishing so HA doesn't flip back while in-flight.
     if (stale) {
       if (g_relay1Desired >= 0) doc["relay1"] = g_relay1Desired;
@@ -1117,8 +1143,15 @@ void loop() {
     } while (millis() < drainEnd);
 
     g_relayCommandPending = false;
-    if (relayRetry) Serial.printf("[gateway] relay retry relay1=%d relay2=%d\n",
-                                  g_relay1Desired, g_relay2Desired);
+    if (relayRetry) {
+      ++g_relayRetryCount;
+      Serial.printf("[gateway] relay retry #%u relay1=%d relay2=%d\n",
+                    g_relayRetryCount, g_relay1Desired, g_relay2Desired);
+      if (g_relayRetryCount == 5 || g_relayRetryCount % 10 == 0) {
+        Serial.printf("[gateway] WARNING: ACT not responding after %u retries\n",
+                      g_relayRetryCount);
+      }
+    }
     g_lastRelayTxMs = millis();
     sendRelayCommand(ACTUATOR_NODE_ID, g_relay1Desired, g_relay2Desired);
   }
