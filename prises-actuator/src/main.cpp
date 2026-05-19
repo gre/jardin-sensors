@@ -167,9 +167,7 @@ static void sendHeartbeat() {
 
   bool txOk = false;
   if (loraReady) {
-    int16_t txState = loraRadio.transmit(reinterpret_cast<const uint8_t*>(buf), n);
-    txOk = (txState == RADIOLIB_ERR_NONE);
-    loraRadio.startReceive();
+    txOk = (loraTx(reinterpret_cast<const uint8_t*>(buf), n) == RADIOLIB_ERR_NONE);
   }
   Serial.printf("[" NODE_ID "] TX seq=%lu relay1=%d relay2=%d bytes=%u ok=%d\n",
                 static_cast<unsigned long>(txSeq - 1),

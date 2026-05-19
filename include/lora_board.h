@@ -115,6 +115,19 @@ static inline size_t loraReadPacket(char* buf, size_t bufSize) {
   return ok ? pktLen : 0;
 }
 
+// CSMA/CAD: scan before TX; if busy, random backoff and retry once.
+// Calls startReceive() before returning — caller must not call it again.
+static inline int16_t loraTx(const uint8_t* buf, size_t len) {
+  if (loraRadio.scanChannel() == RADIOLIB_LORA_DETECTED) {
+    delay(20 + static_cast<int>(random(0, 100)));
+    // Proceed even if second scan is still busy — best-effort, not blocking.
+    loraRadio.scanChannel();
+  }
+  int16_t s = loraRadio.transmit(buf, len);
+  loraRadio.startReceive();
+  return s;
+}
+
 // Reading via analogReadMilliVolts uses the eFuse-calibrated ADC curve (ESP32).
 // On other platforms, raw analogRead with 12-bit 3.3 V reference is assumed.
 inline float readVbatVolts() {

@@ -310,9 +310,7 @@ static void sendRelayCommand(const char* node, int relay1, int relay2) {
                     reinterpret_cast<const uint8_t*>(LORA_PSK),
                     strlen(LORA_PSK));
 
-  int16_t txState = loraRadio.transmit(reinterpret_cast<const uint8_t*>(buf), n);
-  bool txOk = (txState == RADIOLIB_ERR_NONE);
-  loraRadio.startReceive();
+  bool txOk = (loraTx(reinterpret_cast<const uint8_t*>(buf), n) == RADIOLIB_ERR_NONE);
   Serial.printf("[gateway] relay cmd to=%s relay1=%d relay2=%d bytes=%u ok=%d\n",
                 node, relay1, relay2, static_cast<unsigned>(n), txOk ? 1 : 0);
 }
@@ -741,9 +739,7 @@ static void sendConfigTo(const char* node, uint32_t ackSeq) {
                     reinterpret_cast<const uint8_t*>(LORA_PSK),
                     strlen(LORA_PSK));
 
-  int16_t txState = loraRadio.transmit(reinterpret_cast<const uint8_t*>(buf), n);
-  bool txOk = (txState == RADIOLIB_ERR_NONE);
-  loraRadio.startReceive();
+  bool txOk = (loraTx(reinterpret_cast<const uint8_t*>(buf), n) == RADIOLIB_ERR_NONE);
 
   Serial.printf("[gateway] cfg TX to=%s ack=%u tx_interval_s=%d bytes=%u tx_ok=%d\n",
                 node, static_cast<unsigned>(ackSeq),

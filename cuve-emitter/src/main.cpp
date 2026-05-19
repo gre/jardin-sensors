@@ -348,8 +348,7 @@ static void sendSample() {
 
   bool txOk = false;
   if (loraReady) {
-    int16_t txState = loraRadio.transmit(reinterpret_cast<const uint8_t*>(buf), n);
-    txOk = (txState == RADIOLIB_ERR_NONE);
+    txOk = (loraTx(reinterpret_cast<const uint8_t*>(buf), n) == RADIOLIB_ERR_NONE);
   }
 
   Serial.printf("[emitter] TX seq=%lu cfg_req=%d bytes=%u lora=%d tx_ok=%d payload=%s\n",
