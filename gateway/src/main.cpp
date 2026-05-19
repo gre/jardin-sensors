@@ -538,8 +538,9 @@ static void mqttCallback(char* topic, byte* payload, unsigned int len) {
     target = v;
     g_relayTargetNvsDue = millis() + 5000;
     g_relayCommandPending = true;
+    g_relayRetryCount = 0;
     publishRelayOptimistic();
-    Serial.printf("[gateway] relay %s desired=%d target=%d\n", k_relays[i].key, v, v);
+    Serial.printf("[gateway] relay %s desired=%d\n", k_relays[i].key, v);
     return;
   }
 
@@ -656,8 +657,7 @@ static void oledRender() {
   oled.setFont(u8g2_font_6x10_tf);
   if (lastTankPct >= 0) oled.drawStr(65, 44, "%");
 
-  // Right column: temperature + relay state.
-  // Show desired state immediately; append '*' while command is in-flight.
+  // Right column: show desired state immediately; append '*' while command is in-flight.
   char rc[8];
   if (!isnan(lastWaterTempC)) {
     snprintf(rc, sizeof(rc), "%.1fC", lastWaterTempC);
@@ -1149,7 +1149,7 @@ void loop() {
 
     g_relayCommandPending = false;
     if (relayRetry) {
-      ++g_relayRetryCount;
+      if (g_relayRetryCount < 255) ++g_relayRetryCount;
       Serial.printf("[gateway] relay retry #%u relay1=%d relay2=%d\n",
                     g_relayRetryCount, g_relay1Desired, g_relay2Desired);
       if (g_relayRetryCount == 5 || g_relayRetryCount % 10 == 0) {

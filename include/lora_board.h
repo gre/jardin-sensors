@@ -114,12 +114,11 @@ static inline size_t loraReadPacket(char* buf, size_t bufSize) {
   return ok ? pktLen : 0;
 }
 
-// CSMA/CAD: scan before TX; if busy, random backoff and retry once.
+// CSMA/CAD: scan before TX; if busy, back off once then transmit anyway.
 // Calls startReceive() before returning — caller must not call it again.
 static inline int16_t loraTx(const uint8_t* buf, size_t len) {
   if (loraRadio.scanChannel() == RADIOLIB_LORA_DETECTED) {
     delay(20 + static_cast<int>(random(0, 100)));
-    loraRadio.scanChannel();
   }
   int16_t s = loraRadio.transmit(buf, len);
   // Clear CadDone + TxDone spurious DIO flags before re-arming RX.
