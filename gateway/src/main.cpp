@@ -656,17 +656,22 @@ static void oledRender() {
   oled.setFont(u8g2_font_6x10_tf);
   if (lastTankPct >= 0) oled.drawStr(65, 44, "%");
 
-  // Right column: temperature + relay state
+  // Right column: temperature + relay state.
+  // Show desired state immediately; append '*' while command is in-flight.
   char rc[8];
   if (!isnan(lastWaterTempC)) {
     snprintf(rc, sizeof(rc), "%.1fC", lastWaterTempC);
     oled.drawStr(76, 22, rc);
   }
-  snprintf(rc, sizeof(rc), "P1:%s",
-           g_relay1Actual < 0 ? "--" : (g_relay1Actual ? "ON" : "OF"));
+  int oR1 = (g_relay1Desired >= 0) ? g_relay1Desired : g_relay1Actual;
+  int oR2 = (g_relay2Desired >= 0) ? g_relay2Desired : g_relay2Actual;
+  snprintf(rc, sizeof(rc), "P1:%s%s",
+           oR1 < 0 ? "--" : (oR1 ? "ON" : "OF"),
+           g_relay1Desired >= 0 ? "*" : "");
   oled.drawStr(76, 34, rc);
-  snprintf(rc, sizeof(rc), "P2:%s",
-           g_relay2Actual < 0 ? "--" : (g_relay2Actual ? "ON" : "OF"));
+  snprintf(rc, sizeof(rc), "P2:%s%s",
+           oR2 < 0 ? "--" : (oR2 ? "ON" : "OF"),
+           g_relay2Desired >= 0 ? "*" : "");
   oled.drawStr(76, 46, rc);
 
   // Footer: node name + age + RSSI
