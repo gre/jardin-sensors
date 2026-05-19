@@ -392,6 +392,7 @@ static bool publishActuatorDiscovery(const char* node) {
     char valueTpl[48];
     snprintf(valueTpl, sizeof(valueTpl), "{{ value_json.%s }}", sw.key);
     doc["value_template"] = valueTpl;
+    doc["device_class"] = "outlet";
     doc["state_on"]    = "1";
     doc["state_off"]   = "0";
     doc["payload_on"]  = "1";
