@@ -116,7 +116,7 @@ Properties:
 - **Confirmation**: when the actuator's heartbeat echoes the expected state,
   the desired state is cleared. If the heartbeat is missed (gateway was still
   in TX when the actuator responded), the gateway retransmits after
-  `RELAY_CMD_RETRY_MS` (default 8 s).
+  `RELAY_CMD_RETRY_MS` (default 2500 ms).
 - **Stale overlay**: if the heartbeat doesn't match the desired state (packet
   loss, collision), the gateway overlays the desired values before publishing
   so HA does not visually flip back. `g_relayCommandPending` triggers a
@@ -129,9 +129,10 @@ Properties:
   the last commanded state without any gateway intervention.
 - **Restore on actuator reboot**: the first heartbeat after boot carries
   `restore_req:1`. The gateway responds by re-sending the last HA-commanded
-  state (stored in its own NVS, namespace `gw-relay`). Policy controlled by
-  `ACTUATOR_RESTORE_POLICY` in `platformio.ini`: `"restore"` (default, re-apply
-  last command) or `"off"` (send all-off for a safe, predictable restart).
+  state according to the **Power-on behavior** setting (HA select entity,
+  namespace `gw-sec`/`pob`): `previous` (default, re-apply last commanded
+  state), `on` (force all relays on), `off` (force all-off for a safe restart),
+  or `toggle` (invert current state, handled locally by the actuator).
 
 ### HA entities (actuator device "Prises")
 
@@ -139,6 +140,7 @@ Properties:
 |---|---|---|---|
 | `Prise 1` | switch (primary) | `jardin/prises/relay1/set` | |
 | `Prise 2` | switch (primary) | `jardin/prises/relay2/set` | |
+| `Power-on behavior` | select (config) | `jardin/prises/power_on/set` | previous / on / off / toggle |
 | `Battery voltage` | sensor (diagnostic) | `jardin/prises/state` → `vbat` | V |
 | `LoRa RSSI` | sensor (diagnostic) | `jardin/prises/state` → `rssi` | dBm |
 | `LoRa SNR` | sensor (diagnostic) | `jardin/prises/state` → `snr` | dB |
@@ -158,11 +160,13 @@ Heartbeat payload on `jardin/prises/state` (after gateway augmentation):
 Gateway command over LoRa (authenticated):
 
 ```
-{"to":"prises","relay1":1}|<hmac16>
+{"to":"prises","cs":42,"relay1":1,"power_on":"previous"}|<hmac16>
 ```
 
-Only the field(s) being changed are included; the actuator keeps the current
-state for absent fields.
+Fields: `cs` (monotonic command sequence for anti-replay), `relay1`/`relay2`
+(0/1, only changed fields included), `power_on` (power-on behavior, echoed on
+every command so the actuator stays in sync). Absent relay fields keep their
+current state.
 
 ## JSON fields schema (cuve emitter)
 
@@ -576,8 +580,8 @@ packets are arriving without having to look at HA.
 - TX cadence is **runtime-configurable** by the gateway (see *Runtime config sync* below); the emitter persists the chosen value in NVS
 - **CSMA/CAD** (`loraTx()` in `lora_board.h`): every TX call runs a channel
   activity detection scan before transmitting. If the channel is busy, a
-  random 20-120 ms backoff is applied and the scan is retried once before
-  proceeding. Prevents blind collisions when two nodes are close in time.
+  random 20-120 ms backoff is applied, then the packet is transmitted. Prevents
+  blind collisions when two nodes are close in time.
 
 ### Runtime config sync (gateway → emitter)
 
@@ -742,10 +746,10 @@ LORA_PSK undefined`).
 - [x] Bidirectional LoRa: emitter pulls `tx_interval_s` from gateway via `cfg_req`/ack, persists in NVS
 - [x] Deep-sleep mode for battery/solar deployment (build flag `WITH_DEEP_SLEEP=1`)
 - [x] **Relay actuator** (ESP32 + STM32/DX-LR30 variants): LoRa command/heartbeat, NVS/EEPROM persistence, per-channel polarity, HA switch entities
-- [x] Gateway optimistic relay publish + timeout retry (`RELAY_CMD_RETRY_MS=8s`) for reliable HA reactivity
+- [x] Gateway optimistic relay publish + timeout retry (`RELAY_CMD_RETRY_MS=2500ms`) for reliable HA reactivity
 - [x] Migrated radio stack from sandeepmistry/LoRa to jgromes/RadioLib (SX1276 + SX1262 support)
 - [x] **CSMA/CAD**: `loraTx()` wrapper in `lora_board.h` — pre-TX channel scan + random backoff before every transmit across all firmwares
-- [x] **Actuator restore on reboot**: `restore_req:1` in first heartbeat; gateway re-applies last HA-commanded state (`ACTUATOR_RESTORE_POLICY`: `restore` / `off`)
+- [x] **Actuator restore on reboot**: `restore_req:1` in first heartbeat; gateway re-applies state per **Power-on behavior** select entity (`previous` / `on` / `off` / `toggle`)
 - [x] HA switch `device_class: outlet` for relay switch entities
 
 ### Software (possibly later)

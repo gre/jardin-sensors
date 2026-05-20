@@ -483,8 +483,8 @@ static bool publishActuatorDiscovery(const char* node) {
 
 static void publishRelayOptimistic() {
   if (!mqtt.connected()) return;
-  int r1 = g_relay1Desired >= 0 ? g_relay1Desired : g_relay1Actual;
-  int r2 = g_relay2Desired >= 0 ? g_relay2Desired : g_relay2Actual;
+  int r1 = g_relay1Desired >= 0 ? g_relay1Desired : (g_relay1Actual >= 0 ? g_relay1Actual : g_relay1Target);
+  int r2 = g_relay2Desired >= 0 ? g_relay2Desired : (g_relay2Actual >= 0 ? g_relay2Actual : g_relay2Target);
   if (r1 < 0 || r2 < 0) return;
   JsonDocument doc;
   doc["relay1"] = r1;
@@ -926,7 +926,7 @@ static void publishMeasurement(const char* json, size_t jsonLen, int rssi, float
   bool emitterRebooted = false;
   if (st->seenSeq) {
     bool forward = incomingSeq > st->lastSeq;
-    bool likelyReboot = incomingSeq < 100 && st->lastSeq > incomingSeq;
+    bool likelyReboot = incomingSeq < 5 && st->lastSeq > incomingSeq;
     if (!forward && !likelyReboot) {
       Serial.printf("[gateway] replay/reorder drop node=%s seq=%u (last=%u)\n",
                     node, static_cast<unsigned>(incomingSeq),

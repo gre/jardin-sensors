@@ -41,5 +41,8 @@ jobs:
       - name: Build prises-actuator
         run: pio run -e prises-actuator
 
+      - name: Build prises-actuator-dx-lr30 (STM32)
+        run: pio run -e prises-actuator-dx-lr30
+
       - name: Build gateway
         run: pio run -e gateway
