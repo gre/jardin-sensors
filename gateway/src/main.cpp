@@ -1,10 +1,11 @@
 #include <Arduino.h>
-#include <SPI.h>
 #include <WiFi.h>
-#include <LoRa.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include "auth.h"
+#include "wdt.h"
+#include "lora_board.h"
 
 #if WITH_OLED
 #include <Wire.h>
@@ -47,6 +48,9 @@
 #ifndef HA_DEVICE_NAME
 #define HA_DEVICE_NAME "Cuve"
 #endif
+#ifndef HA_ACTUATOR_DEVICE_NAME
+#define HA_ACTUATOR_DEVICE_NAME "Prises"
+#endif
 #ifndef HA_DEVICE_MODEL
 // Emitter model (the HA device), not the gateway.
 #define HA_DEVICE_MODEL "TTGO LoRa32"
@@ -65,6 +69,20 @@
 #endif
 #ifndef MQTT_DOWN_REBOOT_MS
 #define MQTT_DOWN_REBOOT_MS 300000UL
+#endif
+// Retry interval after an unconfirmed relay command. Must exceed the worst-case
+// LoRa round-trip: GW loraTx (~150ms) + ACT process+loraTx (~1950ms) = ~2100ms.
+// ACT loraTx is slow because SX1262 gpioPin=NC forces a 50ms fixed delay per SPI
+// command (~38 commands × 51ms). 2500ms gives ~400ms margin over the round-trip.
+#ifndef RELAY_CMD_RETRY_MS
+#define RELAY_CMD_RETRY_MS 2500UL
+#endif
+// Window to drain queued MQTT relay commands before loraTx, coalescing commands
+// that arrive nearly simultaneously (e.g. relay1+relay2 from the same HA
+// automation) into a single LoRa packet. 50 ms captures typical broker
+// delivery jitter; longer values add visible lag for single-relay commands.
+#ifndef RELAY_BATCH_WINDOW_MS
+#define RELAY_BATCH_WINDOW_MS 50UL
 #endif
 // Debounce for "null = full tank": an isolated null in a valid stream is
 // replaced by the last known value while it is recent. A null sustained
@@ -100,9 +118,35 @@ static_assert(TANK_EMPTY_DISTANCE_CM > TANK_FULL_DISTANCE_CM,
 #define CUVE_TX_INTERVAL_S_MAX 3600
 #endif
 
+// Persist anti-replay state per node every N packets, to bound flash wear.
+// Worst case after a gateway crash: an attacker can replay up to (this many)
+// past packets within their freshness window. 25 @ 60-s cadence = 25 min.
+#ifndef SEQ_PERSIST_EVERY
+#define SEQ_PERSIST_EVERY 5
+#endif
+
 static int g_tankEmptyCm     = TANK_EMPTY_DISTANCE_CM;
 static int g_tankFullCm      = TANK_FULL_DISTANCE_CM;
 static int g_cuveTxIntervalS = CUVE_TX_INTERVAL_S_DEFAULT;
+
+#ifndef ACTUATOR_NODE_ID
+#define ACTUATOR_NODE_ID "prises"
+#endif
+
+// Desired relay state for the relay actuator. -1 = not yet commanded by HA
+// (avoids overriding the actuator's NVS state on gateway reboot).
+static int g_relay1Desired = -1;
+static int g_relay2Desired = -1;
+static bool g_relayCommandPending = false;
+static uint32_t g_lastRelayTxMs = 0;
+static int g_relay1Actual = -1;  // -1 = not yet heard from the actuator
+static int g_relay2Actual = -1;
+static int g_relay1Target = -1;  // last HA-commanded state, NVS-persisted
+static int g_relay2Target = -1;
+static uint32_t g_cmdSeq = 0;    // monotonic relay command counter, NVS-persisted
+static uint32_t g_relayTargetNvsDue = 0;  // millis() when to write target to NVS (0 = nothing pending)
+static char g_powerOnBehavior[12] = "previous";  // "previous"|"on"|"off"|"toggle", NVS-persisted
+static uint8_t g_relayRetryCount = 0;
 
 static WiFiClient wifiClient;
 static PubSubClient mqtt(wifiClient);
@@ -144,29 +188,59 @@ static const HaSensor HA_SENSORS[] = {
   {"tank_pct",     "Tank fill",         nullptr,           "%",   "measurement", nullptr},
   {"water_temp_c", "Water temperature", "temperature",     "°C",  "measurement", nullptr},
   {"tank_cm",      "Tank distance",     "distance",        "cm",  "measurement", "diagnostic"},
+  {"vbat",         "Battery voltage",   "voltage",         "V",   "measurement", "diagnostic"},
   {"rssi",         "LoRa RSSI",         "signal_strength", "dBm", "measurement", "diagnostic"},
   {"snr",          "LoRa SNR",          nullptr,           "dB",  "measurement", "diagnostic"},
 };
 constexpr size_t HA_SENSORS_N = sizeof(HA_SENSORS) / sizeof(HA_SENSORS[0]);
 
+// Relay actuator: switches (primary) + diagnostic sensors.
+struct HaSwitch {
+  const char* key;
+  const char* name;
+};
+static const HaSwitch ACTUATOR_SWITCHES[] = {
+  {"relay1", "Prise 1"},
+  {"relay2", "Prise 2"},
+};
+constexpr size_t ACTUATOR_SWITCHES_N = sizeof(ACTUATOR_SWITCHES) / sizeof(ACTUATOR_SWITCHES[0]);
+
+static const HaSensor ACTUATOR_SENSORS[] = {
+  {"vbat", "Battery voltage", "voltage",         "V",   "measurement", "diagnostic"},
+  {"rssi", "LoRa RSSI",       "signal_strength", "dBm", "measurement", "diagnostic"},
+  {"snr",  "LoRa SNR",        nullptr,           "dB",  "measurement", "diagnostic"},
+};
+constexpr size_t ACTUATOR_SENSORS_N = sizeof(ACTUATOR_SENSORS) / sizeof(ACTUATOR_SENSORS[0]);
+
 struct NodeState {
   String name;
   uint32_t lastSeenMs;
   bool online;
+  bool isActuator;
   float lastValidTankCm;     // NAN until we have ever seen a valid measurement
   uint32_t lastValidTankCmMs;
   bool seenSeq;
   uint32_t lastSeq;
+  uint32_t persistedSeq;     // last seq written to NVS (for dedup)
 };
 
 static NodeState nodes[HA_MAX_NODES];
 static uint8_t nodesCount = 0;
+static Preferences seqPrefs;
 
 static NodeState* findNode(const char* name) {
   for (uint8_t i = 0; i < nodesCount; ++i) {
     if (nodes[i].name == name) return &nodes[i];
   }
   return nullptr;
+}
+
+// NVS keys are limited to 15 chars. Truncate the node name and prefix it; the
+// hash distinguishes longer names that share a prefix.
+static void seqKeyForNode(const char* name, char* out, size_t outLen) {
+  uint32_t h = 2166136261u;
+  for (const char* p = name; *p; ++p) h = (h ^ static_cast<uint8_t>(*p)) * 16777619u;
+  snprintf(out, outLen, "s_%.6s_%04x", name, static_cast<unsigned>(h & 0xFFFF));
 }
 
 static NodeState* registerNode(const char* name) {
@@ -179,11 +253,31 @@ static NodeState* registerNode(const char* name) {
   n.name = name;
   n.lastSeenMs = millis();
   n.online = false;
+  n.isActuator = (strcmp(name, ACTUATOR_NODE_ID) == 0);
   n.lastValidTankCm = NAN;
   n.lastValidTankCmMs = 0;
-  n.seenSeq = false;
-  n.lastSeq = 0;
+
+  char key[16];
+  seqKeyForNode(name, key, sizeof(key));
+  seqPrefs.begin("gw-seq", true);
+  uint32_t saved = seqPrefs.getUInt(key, 0);
+  seqPrefs.end();
+  n.lastSeq      = saved;
+  n.persistedSeq = saved;
+  n.seenSeq      = (saved > 0);
+  Serial.printf("[gateway] node=%s registered, seq restored from NVS=%u\n",
+                name, static_cast<unsigned>(saved));
   return &n;
+}
+
+static void persistSeqIfDue(NodeState& st) {
+  if (st.lastSeq < st.persistedSeq + SEQ_PERSIST_EVERY) return;
+  char key[16];
+  seqKeyForNode(st.name.c_str(), key, sizeof(key));
+  seqPrefs.begin("gw-seq", false);
+  seqPrefs.putUInt(key, st.lastSeq);
+  seqPrefs.end();
+  st.persistedSeq = st.lastSeq;
 }
 
 static void buildStateTopic(const char* node, char* out, size_t outLen) {
@@ -196,6 +290,10 @@ static void buildAvailabilityTopic(const char* node, char* out, size_t outLen) {
 
 static void buildConfigTopic(const char* key, char* out, size_t outLen) {
   snprintf(out, outLen, "%s/config/%s", MQTT_BASE_TOPIC, key);
+}
+
+static void buildCommandTopic(const char* node, const char* key, char* out, size_t outLen) {
+  snprintf(out, outLen, "%s/%s/%s/set", MQTT_BASE_TOPIC, node, key);
 }
 
 struct GwConfig {
@@ -214,6 +312,197 @@ static const GwConfig GW_CONFIG[] = {
    CUVE_TX_INTERVAL_S_MIN, CUVE_TX_INTERVAL_S_MAX, &g_cuveTxIntervalS},
 };
 constexpr size_t GW_CONFIG_N = sizeof(GW_CONFIG) / sizeof(GW_CONFIG[0]);
+
+// Send relay state to the relay actuator over LoRa. Pass -1 for a relay to
+// omit it from the JSON; the actuator keeps the existing state for absent fields.
+static void sendRelayCommand(const char* node, int relay1, int relay2) {
+  JsonDocument doc;
+  doc["to"] = node;
+  if (relay1 >= 0) doc["relay1"] = relay1;
+  if (relay2 >= 0) doc["relay2"] = relay2;
+  doc["cs"] = ++g_cmdSeq;
+  doc["power_on"] = g_powerOnBehavior;
+
+  char buf[160];
+  size_t n = serializeJson(doc, buf, sizeof(buf));
+  n = authAppendMac(buf, n, sizeof(buf),
+                    reinterpret_cast<const uint8_t*>(LORA_PSK),
+                    strlen(LORA_PSK));
+
+  bool txOk = (loraTx(reinterpret_cast<const uint8_t*>(buf), n) == RADIOLIB_ERR_NONE);
+  Serial.printf("[gateway] relay cmd to=%s relay1=%d relay2=%d cs=%lu bytes=%u ok=%d\n",
+                node, relay1, relay2, (unsigned long)g_cmdSeq,
+                static_cast<unsigned>(n), txOk ? 1 : 0);
+
+  Preferences p;
+  p.begin("gw-sec", false);
+  p.putUInt("cs", g_cmdSeq);
+  p.end();
+}
+
+static bool publishSensorDiscoveries(const char* node, const char* deviceName,
+                                     const HaSensor* sensors, size_t count) {
+  char stateTopic[96];
+  buildStateTopic(node, stateTopic, sizeof(stateTopic));
+  char availTopic[96];
+  buildAvailabilityTopic(node, availTopic, sizeof(availTopic));
+  char nodeId[64];
+  snprintf(nodeId, sizeof(nodeId), "%s-%s", MQTT_BASE_TOPIC, node);
+
+  bool allOk = true;
+  for (size_t i = 0; i < count; ++i) {
+    const HaSensor& s = sensors[i];
+    JsonDocument doc;
+    doc["name"] = s.name;
+    char unique[80];
+    snprintf(unique, sizeof(unique), "%s-%s", nodeId, s.key);
+    doc["unique_id"]   = unique;
+    doc["state_topic"] = stateTopic;
+    char valueTpl[48];
+    snprintf(valueTpl, sizeof(valueTpl), "{{ value_json.%s }}", s.key);
+    doc["value_template"] = valueTpl;
+    if (s.deviceClass)    doc["device_class"]        = s.deviceClass;
+    if (s.unit)           doc["unit_of_measurement"] = s.unit;
+    if (s.stateClass)     doc["state_class"]         = s.stateClass;
+    if (s.entityCategory) doc["entity_category"]     = s.entityCategory;
+    doc["availability_topic"]    = availTopic;
+    doc["payload_available"]     = "online";
+    doc["payload_not_available"] = "offline";
+    doc["expire_after"] = (NODE_TIMEOUT_MS / 1000UL) + 30UL;
+
+    JsonObject device = doc["device"].to<JsonObject>();
+    device["identifiers"].add(nodeId);
+    device["name"]         = deviceName;
+    device["model"]        = HA_DEVICE_MODEL;
+    device["manufacturer"] = HA_DEVICE_MANUFACTURER;
+
+    char topic[160];
+    snprintf(topic, sizeof(topic), "%s/sensor/%s/%s/config",
+             HA_DISCOVERY_PREFIX, nodeId, s.key);
+
+    char buf[512];
+    size_t n = serializeJson(doc, buf, sizeof(buf));
+    bool ok = mqtt.publish(topic, reinterpret_cast<const uint8_t*>(buf), n, true);
+    if (!ok) allOk = false;
+    Serial.printf("[gateway] HA sensor %s len=%u ok=%d\n",
+                  topic, static_cast<unsigned>(n), ok);
+  }
+  return allOk;
+}
+
+static bool publishActuatorDiscovery(const char* node) {
+  char stateTopic[96];
+  buildStateTopic(node, stateTopic, sizeof(stateTopic));
+  char availTopic[96];
+  buildAvailabilityTopic(node, availTopic, sizeof(availTopic));
+  char nodeId[64];
+  snprintf(nodeId, sizeof(nodeId), "%s-%s", MQTT_BASE_TOPIC, node);
+
+  bool allOk = true;
+  for (size_t i = 0; i < ACTUATOR_SWITCHES_N; ++i) {
+    const HaSwitch& sw = ACTUATOR_SWITCHES[i];
+    JsonDocument doc;
+    doc["name"] = sw.name;
+    char unique[80];
+    snprintf(unique, sizeof(unique), "%s-%s", nodeId, sw.key);
+    doc["unique_id"]   = unique;
+    doc["state_topic"] = stateTopic;
+    char valueTpl[48];
+    snprintf(valueTpl, sizeof(valueTpl), "{{ value_json.%s }}", sw.key);
+    doc["value_template"] = valueTpl;
+    doc["device_class"] = "outlet";
+    doc["state_on"]    = "1";
+    doc["state_off"]   = "0";
+    doc["payload_on"]  = "1";
+    doc["payload_off"] = "0";
+    char cmdTopic[96];
+    buildCommandTopic(node, sw.key, cmdTopic, sizeof(cmdTopic));
+    doc["command_topic"]         = cmdTopic;
+    doc["availability_topic"]    = availTopic;
+    doc["payload_available"]     = "online";
+    doc["payload_not_available"] = "offline";
+    doc["expire_after"] = (NODE_TIMEOUT_MS / 1000UL) + 30UL;
+
+    JsonObject device = doc["device"].to<JsonObject>();
+    device["identifiers"].add(nodeId);
+    device["name"]         = HA_ACTUATOR_DEVICE_NAME;
+    device["model"]        = HA_DEVICE_MODEL;
+    device["manufacturer"] = HA_DEVICE_MANUFACTURER;
+
+    char topic[160];
+    snprintf(topic, sizeof(topic), "%s/switch/%s/config",
+             HA_DISCOVERY_PREFIX, unique);
+
+    char buf[600];
+    size_t n = serializeJson(doc, buf, sizeof(buf));
+    bool ok = mqtt.publish(topic, reinterpret_cast<const uint8_t*>(buf), n, true);
+    if (!ok) allOk = false;
+    Serial.printf("[gateway] HA actuator switch %s len=%u ok=%d\n",
+                  topic, static_cast<unsigned>(n), ok);
+  }
+  allOk &= publishSensorDiscoveries(node, HA_ACTUATOR_DEVICE_NAME, ACTUATOR_SENSORS, ACTUATOR_SENSORS_N);
+
+  {
+    JsonDocument doc;
+    doc["name"] = "Power-on behavior";
+    char unique[80];
+    snprintf(unique, sizeof(unique), "%s-power_on", nodeId);
+    doc["unique_id"] = unique;
+    char pobState[96];
+    snprintf(pobState, sizeof(pobState), "%s/" ACTUATOR_NODE_ID "/power_on/state",
+             MQTT_BASE_TOPIC);
+    doc["state_topic"] = pobState;
+    char pobCmd[96];
+    snprintf(pobCmd, sizeof(pobCmd), "%s/" ACTUATOR_NODE_ID "/power_on/set",
+             MQTT_BASE_TOPIC);
+    doc["command_topic"] = pobCmd;
+    doc["options"].add("previous");
+    doc["options"].add("on");
+    doc["options"].add("off");
+    doc["options"].add("toggle");
+    doc["entity_category"] = "config";
+
+    JsonObject device = doc["device"].to<JsonObject>();
+    device["identifiers"].add(nodeId);
+    device["name"]         = HA_ACTUATOR_DEVICE_NAME;
+    device["model"]        = HA_DEVICE_MODEL;
+    device["manufacturer"] = HA_DEVICE_MANUFACTURER;
+
+    char topic[160];
+    snprintf(topic, sizeof(topic), "%s/select/%s/config", HA_DISCOVERY_PREFIX, unique);
+
+    char buf[512];
+    size_t n = serializeJson(doc, buf, sizeof(buf));
+    bool ok = mqtt.publish(topic, reinterpret_cast<const uint8_t*>(buf), n, true);
+    allOk = allOk && ok;
+    Serial.printf("[gateway] HA actuator select %s len=%u ok=%d\n",
+                  topic, static_cast<unsigned>(n), ok);
+  }
+  return allOk;
+}
+
+static void publishRelayOptimistic() {
+  if (!mqtt.connected()) return;
+  int r1 = g_relay1Desired >= 0 ? g_relay1Desired : (g_relay1Actual >= 0 ? g_relay1Actual : g_relay1Target);
+  int r2 = g_relay2Desired >= 0 ? g_relay2Desired : (g_relay2Actual >= 0 ? g_relay2Actual : g_relay2Target);
+  if (r1 < 0 || r2 < 0) return;
+  JsonDocument doc;
+  doc["relay1"] = r1;
+  doc["relay2"] = r2;
+  char topic[96];
+  buildStateTopic(ACTUATOR_NODE_ID, topic, sizeof(topic));
+  char buf[64];
+  size_t n = serializeJson(doc, buf, sizeof(buf));
+  mqtt.publish(topic, reinterpret_cast<const uint8_t*>(buf), n, true);
+  Serial.printf("[gateway] relay optimistic relay1=%d relay2=%d\n", r1, r2);
+}
+
+static void publishPowerOnState() {
+  if (!mqtt.connected()) return;
+  char topic[96];
+  snprintf(topic, sizeof(topic), "%s/" ACTUATOR_NODE_ID "/power_on/state", MQTT_BASE_TOPIC);
+  mqtt.publish(topic, g_powerOnBehavior, true);
+}
 
 static void mqttCallback(char* topic, byte* payload, unsigned int len) {
   char buf[16];
@@ -236,6 +525,43 @@ static void mqttCallback(char* topic, byte* payload, unsigned int len) {
     Serial.printf("[gateway] config %s = %d\n", c.key, v);
     return;
   }
+
+  static const struct { const char* topic; int* desired; const char* key; } k_relays[] = {
+    {MQTT_BASE_TOPIC "/" ACTUATOR_NODE_ID "/relay1/set", &g_relay1Desired, "relay1"},
+    {MQTT_BASE_TOPIC "/" ACTUATOR_NODE_ID "/relay2/set", &g_relay2Desired, "relay2"},
+  };
+  for (size_t i = 0; i < sizeof(k_relays) / sizeof(k_relays[0]); ++i) {
+    if (strcmp(topic, k_relays[i].topic) != 0) continue;
+    int v = constrain(atoi(buf), 0, 1);
+    *k_relays[i].desired = v;
+    int& target = (i == 0) ? g_relay1Target : g_relay2Target;
+    target = v;
+    g_relayTargetNvsDue = millis() + 5000;
+    g_relayCommandPending = true;
+    g_relayRetryCount = 0;
+    publishRelayOptimistic();
+    Serial.printf("[gateway] relay %s desired=%d\n", k_relays[i].key, v);
+    return;
+  }
+
+  char pobSetTopic[96];
+  snprintf(pobSetTopic, sizeof(pobSetTopic),
+           "%s/" ACTUATOR_NODE_ID "/power_on/set", MQTT_BASE_TOPIC);
+  if (strcmp(topic, pobSetTopic) == 0) {
+    if (strcmp(buf, "previous") == 0 || strcmp(buf, "on") == 0 ||
+        strcmp(buf, "off") == 0 || strcmp(buf, "toggle") == 0) {
+      strncpy(g_powerOnBehavior, buf, sizeof(g_powerOnBehavior) - 1);
+      g_powerOnBehavior[sizeof(g_powerOnBehavior) - 1] = 0;
+      Preferences p;
+      p.begin("gw-sec", false);
+      p.putString("pob", g_powerOnBehavior);
+      p.end();
+      publishPowerOnState();
+      g_relayCommandPending = true;
+      Serial.printf("[gateway] power_on set=%s\n", g_powerOnBehavior);
+    }
+    return;
+  }
 }
 
 static bool publishAvailability(const char* node, bool online) {
@@ -248,27 +574,35 @@ static bool publishAvailability(const char* node, bool online) {
   return ok;
 }
 
+static void ledUpdateError() {
+  bool anyOffline = false;
+  for (uint8_t i = 0; i < nodesCount; ++i) {
+    if (!nodes[i].online) { anyOffline = true; break; }
+  }
+  digitalWrite(LED_PIN, (nodesCount > 0 && anyOffline) ? HIGH : LOW);
+}
+
 static void checkNodeTimeouts() {
   uint32_t now = millis();
   for (uint8_t i = 0; i < nodesCount; ++i) {
     NodeState& n = nodes[i];
     if (!n.online) continue;
     if ((now - n.lastSeenMs) <= NODE_TIMEOUT_MS) continue;
-    // Only flip RAM state if the broker actually received it, otherwise retry next tick.
     if (publishAvailability(n.name.c_str(), false)) {
       n.online = false;
+      ledUpdateError();
     }
   }
 }
 
 static void loraInit() {
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  if (!LoRa.begin(LORA_BAND)) {
-    Serial.println("[gateway] LoRa init failed");
+  int16_t s = loraBegin();
+  if (s != RADIOLIB_ERR_NONE) {
+    Serial.printf("[gateway] LoRa init failed: %d\n", s);
+    digitalWrite(LED_PIN, HIGH);
     while (true) delay(1000);
   }
-  LoRa.enableCrc();
+  loraRadio.startReceive();
 }
 
 static void wifiInit() {
@@ -321,14 +655,24 @@ static void oledRender() {
     oled.drawStr(8, 44, num);
   }
   oled.setFont(u8g2_font_6x10_tf);
-  if (lastTankPct >= 0) oled.drawStr(72, 44, "%");
+  if (lastTankPct >= 0) oled.drawStr(65, 44, "%");
 
-  // Small temperature on the right if available
+  // Right column: show desired state immediately; append '*' while command is in-flight.
+  char rc[8];
   if (!isnan(lastWaterTempC)) {
-    char tmp[12];
-    snprintf(tmp, sizeof(tmp), "%.1fC", lastWaterTempC);
-    oled.drawStr(86, 36, tmp);
+    snprintf(rc, sizeof(rc), "%.1fC", lastWaterTempC);
+    oled.drawStr(76, 22, rc);
   }
+  int oR1 = (g_relay1Desired >= 0) ? g_relay1Desired : g_relay1Actual;
+  int oR2 = (g_relay2Desired >= 0) ? g_relay2Desired : g_relay2Actual;
+  snprintf(rc, sizeof(rc), "P1:%s%s",
+           oR1 < 0 ? "--" : (oR1 ? "ON" : "OF"),
+           g_relay1Desired >= 0 ? "*" : "");
+  oled.drawStr(76, 34, rc);
+  snprintf(rc, sizeof(rc), "P2:%s%s",
+           oR2 < 0 ? "--" : (oR2 ? "ON" : "OF"),
+           g_relay2Desired >= 0 ? "*" : "");
+  oled.drawStr(76, 46, rc);
 
   // Footer: node name + age + RSSI
   oled.drawHLine(0, 50, 128);
@@ -415,11 +759,50 @@ static void publishConfigDiscovery() {
   }
 }
 
+static void loadRelayTarget() {
+  Preferences p;
+  p.begin("gw-relay", true);
+  int v1 = p.getInt("r1t", -1);
+  int v2 = p.getInt("r2t", -1);
+  p.end();
+  if (v1 >= 0 && v1 <= 1) g_relay1Target = v1;
+  if (v2 >= 0 && v2 <= 1) g_relay2Target = v2;
+  Serial.printf("[gateway] relay target loaded: r1=%d r2=%d\n", g_relay1Target, g_relay2Target);
+}
+
+static void loadCmdSeq() {
+  Preferences p;
+  p.begin("gw-sec", true);
+  g_cmdSeq = p.getUInt("cs", 0);
+  p.end();
+  Serial.printf("[gateway] cmdSeq loaded: %lu\n", (unsigned long)g_cmdSeq);
+}
+
+static void loadPowerOnBehavior() {
+  Preferences p;
+  p.begin("gw-sec", true);
+  size_t n = p.getString("pob", g_powerOnBehavior, sizeof(g_powerOnBehavior));
+  p.end();
+  if (n == 0 ||
+      (strcmp(g_powerOnBehavior, "previous") != 0 &&
+       strcmp(g_powerOnBehavior, "on") != 0 &&
+       strcmp(g_powerOnBehavior, "off") != 0 &&
+       strcmp(g_powerOnBehavior, "toggle") != 0)) {
+    strcpy(g_powerOnBehavior, "previous");
+  }
+  Serial.printf("[gateway] powerOnBehavior=%s\n", g_powerOnBehavior);
+}
+
+static bool publishDiscovery(const char* node) {
+  return publishSensorDiscoveries(node, HA_DEVICE_NAME, HA_SENSORS, HA_SENSORS_N);
+}
+
 static void mqttInit() {
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(mqttCallback);
   // Discovery payload + topic + headers exceed the default 256 bytes.
-  mqtt.setBufferSize(768);
+  // Switch discovery payload can reach ~550 bytes.
+  mqtt.setBufferSize(1024);
 }
 
 static void mqttEnsureConnected() {
@@ -443,7 +826,22 @@ static void mqttEnsureConnected() {
     char sub[64];
     snprintf(sub, sizeof(sub), "%s/config/+", MQTT_BASE_TOPIC);
     mqtt.subscribe(sub);
+    mqtt.subscribe(MQTT_BASE_TOPIC "/" ACTUATOR_NODE_ID "/+/set");
     publishConfigDiscovery();
+    publishPowerOnState();
+    // Re-publish discovery + availability for nodes already seen this session
+    // so HA recovers immediately after a broker restart without waiting for the
+    // next heartbeat.
+    for (uint8_t i = 0; i < nodesCount; ++i) {
+      const char* name = nodes[i].name.c_str();
+      if (nodes[i].isActuator) {
+        publishActuatorDiscovery(name);
+      } else {
+        publishDiscovery(name);
+      }
+      publishAvailability(name, nodes[i].online);
+    }
+    publishRelayOptimistic();
     Serial.printf("[gateway] MQTT connected to %s:%d, subscribed %s\n",
                   MQTT_HOST, MQTT_PORT, sub);
   } else {
@@ -452,57 +850,6 @@ static void mqttEnsureConnected() {
                   static_cast<unsigned long>(MQTT_RECONNECT_BACKOFF_MS));
     nextAttempt = millis() + MQTT_RECONNECT_BACKOFF_MS;
   }
-}
-
-static bool publishDiscovery(const char* node) {
-  char stateTopic[96];
-  buildStateTopic(node, stateTopic, sizeof(stateTopic));
-
-  char nodeId[64];
-  snprintf(nodeId, sizeof(nodeId), "%s-%s", MQTT_BASE_TOPIC, node);
-
-  bool allOk = true;
-  for (size_t i = 0; i < HA_SENSORS_N; ++i) {
-    const HaSensor& s = HA_SENSORS[i];
-
-    JsonDocument doc;
-    doc["name"]        = s.name;
-    char unique[80];
-    snprintf(unique, sizeof(unique), "%s-%s", nodeId, s.key);
-    doc["unique_id"]   = unique;
-    doc["state_topic"] = stateTopic;
-    char valueTpl[48];
-    snprintf(valueTpl, sizeof(valueTpl), "{{ value_json.%s }}", s.key);
-    doc["value_template"] = valueTpl;
-    if (s.deviceClass)    doc["device_class"]        = s.deviceClass;
-    if (s.unit)           doc["unit_of_measurement"] = s.unit;
-    if (s.stateClass)     doc["state_class"]         = s.stateClass;
-    if (s.entityCategory) doc["entity_category"]     = s.entityCategory;
-
-    char availTopic[96];
-    buildAvailabilityTopic(node, availTopic, sizeof(availTopic));
-    doc["availability_topic"]    = availTopic;
-    doc["payload_available"]     = "online";
-    doc["payload_not_available"] = "offline";
-
-    JsonObject device = doc["device"].to<JsonObject>();
-    device["identifiers"].add(nodeId);
-    device["name"]         = HA_DEVICE_NAME;
-    device["model"]        = HA_DEVICE_MODEL;
-    device["manufacturer"] = HA_DEVICE_MANUFACTURER;
-
-    char topic[160];
-    snprintf(topic, sizeof(topic), "%s/sensor/%s/%s/config",
-             HA_DISCOVERY_PREFIX, nodeId, s.key);
-
-    char buf[512];
-    size_t n = serializeJson(doc, buf, sizeof(buf));
-    bool ok = mqtt.publish(topic, reinterpret_cast<const uint8_t*>(buf), n, true);
-    if (!ok) allOk = false;
-    Serial.printf("[gateway] HA discover %s len=%u ok=%d\n",
-                  topic, static_cast<unsigned>(n), ok);
-  }
-  return allOk;
 }
 
 static void augmentDerived(JsonDocument& doc, NodeState& st) {
@@ -544,29 +891,31 @@ static void sendConfigTo(const char* node, uint32_t ackSeq) {
                     reinterpret_cast<const uint8_t*>(LORA_PSK),
                     strlen(LORA_PSK));
 
-  LoRa.beginPacket();
-  LoRa.write(reinterpret_cast<const uint8_t*>(buf), n);
-  LoRa.endPacket();
+  bool txOk = (loraTx(reinterpret_cast<const uint8_t*>(buf), n) == RADIOLIB_ERR_NONE);
 
-  Serial.printf("[gateway] cfg TX to=%s ack=%u tx_interval_s=%d bytes=%u\n",
+  Serial.printf("[gateway] cfg TX to=%s ack=%u tx_interval_s=%d bytes=%u tx_ok=%d\n",
                 node, static_cast<unsigned>(ackSeq),
-                g_cuveTxIntervalS, static_cast<unsigned>(n));
+                g_cuveTxIntervalS, static_cast<unsigned>(n),
+                txOk ? 1 : 0);
 }
 
-static void publishMeasurement(const String& loraJson, int rssi, float snr) {
+static void publishMeasurement(const char* json, size_t jsonLen, int rssi, float snr) {
   if (!mqtt.connected()) return;
 
   JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, loraJson);
+  DeserializationError err = deserializeJson(doc, json, jsonLen);
   if (err) {
     Serial.printf("[gateway] JSON parse error: %s\n", err.c_str());
     return;
   }
   const char* node = doc["node"] | "unknown";
 
+  bool isActuator = (strcmp(node, ACTUATOR_NODE_ID) == 0);
+
   NodeState* st = findNode(node);
   if (!st) {
-    if (!publishDiscovery(node)) return;
+    bool discovered = isActuator ? publishActuatorDiscovery(node) : publishDiscovery(node);
+    if (!discovered) return;
     st = registerNode(node);
     if (!st) return;
   }
@@ -574,21 +923,30 @@ static void publishMeasurement(const String& loraJson, int rssi, float snr) {
   // Anti-replay: reject seq <= last seen (unless very small, which suggests
   // an emitter reboot starting from 0).
   uint32_t incomingSeq = doc["seq"].as<uint32_t>();
+  bool emitterRebooted = false;
   if (st->seenSeq) {
     bool forward = incomingSeq > st->lastSeq;
-    bool likelyReboot = incomingSeq < 100 && st->lastSeq > 10000;
+    bool likelyReboot = incomingSeq < 5 && st->lastSeq > incomingSeq;
     if (!forward && !likelyReboot) {
       Serial.printf("[gateway] replay/reorder drop node=%s seq=%u (last=%u)\n",
                     node, static_cast<unsigned>(incomingSeq),
                     static_cast<unsigned>(st->lastSeq));
       return;
     }
+    emitterRebooted = likelyReboot && !forward;
   }
   st->lastSeq = incomingSeq;
   st->seenSeq = true;
   st->lastSeenMs = millis();
+  if (emitterRebooted) {
+    // Emitter just power-cycled: persist immediately so the new low seq
+    // survives a gateway reboot before SEQ_PERSIST_EVERY accumulates.
+    st->persistedSeq = 0;
+  }
+  persistSeqIfDue(*st);
   if (!st->online && publishAvailability(node, true)) {
     st->online = true;
+    ledUpdateError();
   }
 
   // cfg_req: emitter wants the latest config back. Reply over LoRa first
@@ -600,7 +958,57 @@ static void publishMeasurement(const String& loraJson, int rssi, float snr) {
 
   doc["rssi"] = rssi;
   doc["snr"]  = snr;
-  augmentDerived(doc, *st);
+
+  if (!isActuator) {
+    augmentDerived(doc, *st);
+  } else {
+    if (doc["restore_req"].as<bool>()) {
+      if (strcmp(g_powerOnBehavior, "on") == 0) {
+        g_relay1Desired = 1;
+        g_relay2Desired = 1;
+        g_relayCommandPending = true;
+        publishRelayOptimistic();
+      } else if (strcmp(g_powerOnBehavior, "off") == 0) {
+        g_relay1Desired = 0;
+        g_relay2Desired = 0;
+        g_relayCommandPending = true;
+        publishRelayOptimistic();
+      } else if (strcmp(g_powerOnBehavior, "previous") == 0 &&
+                 g_relay1Target >= 0 && g_relay2Target >= 0) {
+        g_relay1Desired = g_relay1Target;
+        g_relay2Desired = g_relay2Target;
+        g_relayCommandPending = true;
+        publishRelayOptimistic();
+      }
+      // "toggle": actuator handles it locally; gateway observes the result
+      Serial.printf("[gateway] restore_req pob=%s target=%d,%d desired=%d,%d\n",
+                    g_powerOnBehavior, g_relay1Target, g_relay2Target,
+                    g_relay1Desired, g_relay2Desired);
+    }
+
+    int actual1 = doc["relay1"] | -1;
+    int actual2 = doc["relay2"] | -1;
+    if (actual1 >= 0) g_relay1Actual = actual1;
+    if (actual2 >= 0) g_relay2Actual = actual2;
+    bool stale = false;
+    if (g_relay1Desired >= 0 && actual1 >= 0) {
+      if (actual1 != g_relay1Desired) { g_relayCommandPending = true; stale = true; }
+      else g_relay1Desired = -1;
+    }
+    if (g_relay2Desired >= 0 && actual2 >= 0) {
+      if (actual2 != g_relay2Desired) { g_relayCommandPending = true; stale = true; }
+      else g_relay2Desired = -1;
+    }
+    if (g_relay1Desired < 0 && g_relay2Desired < 0 && g_relayRetryCount > 0) {
+      Serial.printf("[gateway] relay confirmed after %u retries\n", g_relayRetryCount);
+      g_relayRetryCount = 0;
+    }
+    // Overlay desired before publishing so HA doesn't flip back while in-flight.
+    if (stale) {
+      if (g_relay1Desired >= 0) doc["relay1"] = g_relay1Desired;
+      if (g_relay2Desired >= 0) doc["relay2"] = g_relay2Desired;
+    }
+  }
 
   char topic[96];
   buildStateTopic(node, topic, sizeof(topic));
@@ -622,6 +1030,12 @@ void setup() {
   uint32_t t0 = millis();
   while (!Serial && (millis() - t0) < 2000) {}
 
+  watchdogInit();
+  loadRelayTarget();
+  loadCmdSeq();
+  loadPowerOnBehavior();
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
   Serial.printf("[gateway] band=%lu Hz\n",
                 static_cast<unsigned long>(LORA_BAND));
 #if WITH_OLED
@@ -665,6 +1079,7 @@ static void softWatchdog() {
 }
 
 void loop() {
+  watchdogFeed();
   wifiPoll();
   mqttEnsureConnected();
   mqtt.loop();
@@ -680,26 +1095,69 @@ void loop() {
   }
 #endif
 
-  int sz = LoRa.parsePacket();
-  if (sz <= 0) return;
-
-  String msg;
-  msg.reserve(sz);
-  while (LoRa.available()) msg += static_cast<char>(LoRa.read());
-
-  int rssi  = LoRa.packetRssi();
-  float snr = LoRa.packetSnr();
-
-  int jsonLen = authVerifyMac(msg.c_str(), msg.length(),
-                              reinterpret_cast<const uint8_t*>(LORA_PSK),
-                              strlen(LORA_PSK));
-  if (jsonLen < 0) {
-    Serial.printf("[gateway] HMAC invalid, drop %d bytes rssi=%d\n", sz, rssi);
-    return;
+  // Process LoRa RX before relay commands so ACT confirmations are seen first.
+  // This prevents heartbeats from being lost inside a back-to-back loraTx.
+  if (loraRxFlag) {
+    loraRxFlag = false;
+    int rssi = static_cast<int>(loraRadio.getRSSI());
+    float snr = loraRadio.getSNR();
+    char rxBuf[200];
+    size_t pktLen = loraReadPacket(rxBuf, sizeof(rxBuf));
+    if (pktLen > 0) {
+      int jsonLen = authVerifyMac(rxBuf, static_cast<int>(pktLen),
+                                  reinterpret_cast<const uint8_t*>(LORA_PSK),
+                                  strlen(LORA_PSK));
+      if (jsonLen < 0) {
+        Serial.printf("[gateway] HMAC invalid, drop %u bytes rssi=%d\n",
+                      static_cast<unsigned>(pktLen), rssi);
+      } else {
+        Serial.printf("[gateway] RX rssi=%d snr=%.2f bytes=%u json=%.*s\n",
+                      rssi, snr, static_cast<unsigned>(pktLen), jsonLen, rxBuf);
+        publishMeasurement(rxBuf, static_cast<size_t>(jsonLen), rssi, snr);
+        digitalWrite(LED_PIN, HIGH);
+        delay(50);
+        ledUpdateError();
+      }
+    }
   }
-  String jsonOnly = msg.substring(0, jsonLen);
-  Serial.printf("[gateway] RX rssi=%d snr=%.2f bytes=%d json=%s\n",
-                rssi, snr, sz, jsonOnly.c_str());
 
-  publishMeasurement(jsonOnly, rssi, snr);
+  // Lazy NVS persist: write relay targets 5 s after last HA command, outside
+  // the relay send path so it never blocks back-to-back relay commands.
+  uint32_t nowMs = millis();
+  if (g_relayTargetNvsDue > 0 && nowMs >= g_relayTargetNvsDue) {
+    g_relayTargetNvsDue = 0;
+    Preferences p;
+    p.begin("gw-relay", false);
+    if (g_relay1Target >= 0) p.putInt("r1t", g_relay1Target);
+    if (g_relay2Target >= 0) p.putInt("r2t", g_relay2Target);
+    p.end();
+  }
+
+  bool relayRetry = !g_relayCommandPending &&
+                    (g_relay1Desired >= 0 || g_relay2Desired >= 0) &&
+                    (nowMs - g_lastRelayTxMs) >= RELAY_CMD_RETRY_MS;
+  if (g_relayCommandPending || relayRetry) {
+    // Drain MQTT for RELAY_BATCH_WINDOW_MS to coalesce rapid relay commands
+    // (e.g. 3 toggles 100 ms apart) into a single LoRa packet with the final
+    // desired state, avoiding ACT heartbeat / GW loraTx collisions.
+    uint32_t drainEnd = millis() + RELAY_BATCH_WINDOW_MS;
+    do {
+      watchdogFeed();
+      mqtt.loop();
+      delay(10);
+    } while (millis() < drainEnd);
+
+    g_relayCommandPending = false;
+    if (relayRetry) {
+      if (g_relayRetryCount < 255) ++g_relayRetryCount;
+      Serial.printf("[gateway] relay retry #%u relay1=%d relay2=%d\n",
+                    g_relayRetryCount, g_relay1Desired, g_relay2Desired);
+      if (g_relayRetryCount == 5 || g_relayRetryCount % 10 == 0) {
+        Serial.printf("[gateway] WARNING: ACT not responding after %u retries\n",
+                      g_relayRetryCount);
+      }
+    }
+    g_lastRelayTxMs = millis();
+    sendRelayCommand(ACTUATOR_NODE_ID, g_relay1Desired, g_relay2Desired);
+  }
 }

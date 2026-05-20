@@ -5,10 +5,11 @@
 
 ## Goal
 
-Monitoring and alerting system for the **water level of the garden tank**:
+Monitoring, alerting, and remote control for the garden:
 
 - tank level reported via ultrasonic sensor
 - "needs refill" notification
+- **remote outlet control** (relay actuator) — switch garden sockets from HA
 - centralized integration into **Home Assistant**
 
 ## Constraints
@@ -38,28 +39,36 @@ flowchart LR
     Sensor((Sensor))
     Emitter["<b>EMITTER</b><br/>raw values + meta<br/><br/><i>physical filtering<br/>tx interval</i>"]
     Gateway["<b>GATEWAY</b><br/>raw + derived<br/><br/><i>calibration geometry<br/>link tracking</i>"]
+    Actuator["<b>ACTUATOR</b><br/>relay state<br/><br/><i>cmd + heartbeat</i>"]
     HA["<b>HOME ASSISTANT</b><br/>raw + derived entities<br/><br/><i>automation<br/>notifications<br/>long-term storage</i>"]
     Sensor --> Emitter
     Emitter -->|"LoRa<br/>point-to-point"| Gateway
     Gateway -->|"MQTT retain<br/>+ discovery"| HA
+    HA -->|"MQTT set"| Gateway
+    Gateway -->|"LoRa cmd"| Actuator
+    Actuator -->|"LoRa heartbeat"| Gateway
 ```
 
 ## Overall architecture
 
-Both nodes run on **the same board** (LILYGO LoRa32 T3 V1.6.1); only the
-firmware differs. The role is selected by the PlatformIO env (`emitter` or
-`gateway`).
+The emitter and gateway run on the same board (LILYGO LoRa32 T3 V1.6.1).
+The actuator has two firmware variants: the same LILYGO board
+(`prises-actuator`) or a **DX-LR30** module (STM32F103 + SX1262,
+`prises-actuator-dx-lr30`).
 
 ```mermaid
 flowchart TB
     subgraph garden ["🌿 GARDEN"]
-        E["<b>EMITTER</b><br/>LILYGO LoRa32 T3 V1.6.1<br/>━━━━━━━━━━━━<br/>SR04M-2 → tank_cm<br/>DS18B20 → water_temp_c<br/>LoRa TX every 1 s<br/><br/><i>'dumb sensor'</i>"]
+        E["<b>EMITTER</b><br/>LILYGO LoRa32 T3 V1.6.1<br/>━━━━━━━━━━━━<br/>SR04M-2 → tank_cm<br/>DS18B20 → water_temp_c<br/>LoRa TX every ~60 s<br/><br/><i>'dumb sensor'</i>"]
+        A["<b>ACTUATOR</b><br/>LILYGO LoRa32 T3 V1.6.1<br/><i>or</i> DX-LR30 (STM32F103)<br/>━━━━━━━━━━━━<br/>2-channel relay module<br/>LoRa RX cmds + TX heartbeat<br/>state persisted in NVS/EEPROM"]
     end
     subgraph house ["🏠 HOUSE"]
-        G["<b>GATEWAY</b><br/>LILYGO LoRa32 T3 V1.6.1<br/>━━━━━━━━━━━━<br/>Verify HMAC, decode JSON<br/>Derive tank_pct<br/>Track availability<br/>MQTT publish + LWT<br/>HA auto-discovery<br/><br/><i>'smart hub'</i>"]
-        HA["<b>Home Assistant</b><br/>auto discovery<br/>notifications<br/>long-term graphs"]
+        G["<b>GATEWAY</b><br/>LILYGO LoRa32 T3 V1.6.1<br/>━━━━━━━━━━━━<br/>Verify HMAC, decode JSON<br/>Derive tank_pct<br/>Track availability<br/>MQTT publish + LWT<br/>HA auto-discovery<br/>Relay cmd + retry<br/><br/><i>'smart hub'</i>"]
+        HA["<b>Home Assistant</b><br/>auto discovery<br/>notifications<br/>long-term graphs<br/>switch entities"]
     end
-    E -->|"LoRa 868.1 MHz<br/>~100 m point-to-point"| G
+    E -->|"LoRa 868.1 MHz"| G
+    G -->|"LoRa cmd"| A
+    A -->|"LoRa heartbeat"| G
     G -->|"Wi-Fi + MQTT"| HA
 ```
 
@@ -77,7 +86,89 @@ flowchart TB
     GW --> diag["<b>tank_cm</b> relayed in parallel<br/><i>diagnostic entity</i>"]
 ```
 
-## JSON fields schema
+## Relay actuator
+
+A second LoRa node in the garden controls a **2-channel relay module** (garden
+sockets). The gateway bridges HA switch commands to LoRa and tracks the
+actuator's state.
+
+### Command/heartbeat protocol
+
+```mermaid
+sequenceDiagram
+    participant H as Home Assistant
+    participant G as Gateway
+    participant A as Actuator
+
+    H->>G: MQTT jardin/prises/relay1/set = 1
+    Note over G: optimistic publish<br/>jardin/prises/state {relay1:1,...}
+    G->>A: LoRa { to:prises, relay1:1 } + HMAC
+    A->>A: set relay, persist to NVS/EEPROM
+    A->>G: LoRa heartbeat { node:prises, relay1:1, relay2:0, vbat, seq } + HMAC
+    G->>H: MQTT jardin/prises/state (confirmed, retain)
+    Note over G: desired cleared — command confirmed
+```
+
+Properties:
+- **Optimistic publish**: the gateway immediately updates `jardin/prises/state`
+  when a command arrives from HA, without waiting for the LoRa round-trip.
+  HA feels instant.
+- **Confirmation**: when the actuator's heartbeat echoes the expected state,
+  the desired state is cleared. If the heartbeat is missed (gateway was still
+  in TX when the actuator responded), the gateway retransmits after
+  `RELAY_CMD_RETRY_MS` (default 2500 ms).
+- **Stale overlay**: if the heartbeat doesn't match the desired state (packet
+  loss, collision), the gateway overlays the desired values before publishing
+  so HA does not visually flip back. `g_relayCommandPending` triggers a
+  retransmit.
+- **Periodic heartbeat**: the actuator also sends a heartbeat every
+  `TX_INTERVAL_S` seconds (default 60 s) so `rssi`/`vbat`/`snr` stay fresh
+  in HA even with no commands.
+- **State persistence**: relay state is saved to NVS (ESP32 `Preferences`) or
+  EEPROM (STM32) on every change and restored at boot, so a power cycle keeps
+  the last commanded state without any gateway intervention.
+- **Restore on actuator reboot**: the first heartbeat after boot carries
+  `restore_req:1`. The gateway responds by re-sending the last HA-commanded
+  state according to the **Power-on behavior** setting (HA select entity,
+  namespace `gw-sec`/`pob`): `previous` (default, re-apply last commanded
+  state), `on` (force all relays on), `off` (force all-off for a safe restart),
+  or `toggle` (invert current state, handled locally by the actuator).
+
+### HA entities (actuator device "Prises")
+
+| Entity | Type | MQTT topic | Notes |
+|---|---|---|---|
+| `Prise 1` | switch (primary) | `jardin/prises/relay1/set` | |
+| `Prise 2` | switch (primary) | `jardin/prises/relay2/set` | |
+| `Power-on behavior` | select (config) | `jardin/prises/power_on/set` | previous / on / off / toggle |
+| `Battery voltage` | sensor (diagnostic) | `jardin/prises/state` → `vbat` | V |
+| `LoRa RSSI` | sensor (diagnostic) | `jardin/prises/state` → `rssi` | dBm |
+| `LoRa SNR` | sensor (diagnostic) | `jardin/prises/state` → `snr` | dB |
+
+Availability: same mechanism as the emitter — `jardin/prises/availability`
+goes `offline` after `NODE_TIMEOUT_MS` (3 min) without a heartbeat.
+
+### Actuator JSON schema
+
+Heartbeat payload on `jardin/prises/state` (after gateway augmentation):
+
+```json
+{ "node": "prises", "seq": 12, "relay1": 1, "relay2": 0, "vbat": 3.82,
+  "rssi": -71, "snr": 8.5 }
+```
+
+Gateway command over LoRa (authenticated):
+
+```
+{"to":"prises","cs":42,"relay1":1,"power_on":"previous"}|<hmac16>
+```
+
+Fields: `cs` (monotonic command sequence for anti-replay), `relay1`/`relay2`
+(0/1, only changed fields included), `power_on` (power-on behavior, echoed on
+every command so the actuator stays in sync). Absent relay fields keep their
+current state.
+
+## JSON fields schema (cuve emitter)
 
 | Field | Source | Type | Unit | HA category | Meaning |
 |---|---|---|---|---|---|
@@ -200,8 +291,9 @@ enough.
 ```mermaid
 flowchart LR
     HA["<b>homeassistant/</b><br/><i>HA discovery prefix</i>"]
-    HA --> HAS["sensor/jardin-{node}/{key}/config<br/><i>one per sensor x emitter</i>"]
+    HA --> HAS["sensor/jardin-{node}/{key}/config<br/><i>one per sensor x node</i>"]
     HA --> HAN["number/jardin-gateway/{key}/config<br/><i>runtime config sliders</i>"]
+    HA --> HASW["switch/jardin-prises-{key}/config<br/><i>relay switch entities</i>"]
 
     J["<b>jardin/</b><br/><i>MQTT_BASE_TOPIC</i>"]
     J --> JS["{node}/state<br/><i>full JSON payload, retain</i>"]
@@ -211,6 +303,7 @@ flowchart LR
     JC --> JCE[tank_empty_cm]
     JC --> JCF[tank_full_cm]
     JC --> JCT[cuve_tx_interval_s]
+    J --> JR["prises/{relay}/set<br/><i>HA switch command, 0 or 1</i>"]
 ```
 
 Example payload for `jardin/cuve/state` after augmentation by the gateway:
@@ -280,15 +373,40 @@ have been down for more than 5 min.
 
 ### Boards
 
-**2x LILYGO LoRa32 T3 V1.6.1**, identical (silkscreen `T3_V1.6.1 20210104`).
+**2x LILYGO LoRa32 T3 V1.6.1** (emitter + gateway), identical (silkscreen
+`T3_V1.6.1 20210104`).
 
 - ESP32-PICO-D4 + LILYGO LORA32 module (SX1276, 868/915 MHz)
 - CH9102F USB-UART, micro-USB port, ON/OFF switch, JST battery
 - SMA + IPEX antenna connector
 - Built-in OLED SSD1306 0.96" (I2C: SDA=21, SCL=22, RST=16)
-- One board → emitter (garden), the other → gateway (house). Role is chosen via the PlatformIO env, not via hardware.
 
-> Note: vendor listings may still mention "TTGO" or refs like `2ASYE-T3-V1-6-1` / `XY241015`. Same product (TTGO = old LILYGO sub-branding).
+> Note: vendor listings may still mention "TTGO" (`2ASYE-T3-V1-6-1` / `XY241015`). Same product.
+
+**1x DX-LR30** (actuator alternative) — STM32F103C8T6 + SX1262 LoRa module.
+
+- STM32F103C8T6 (72 MHz Cortex-M3, 64 KB flash, 20 KB SRAM)
+- SX1262 LoRa radio (868 MHz), XOSC 32 MHz crystal (not TCXO)
+- External RF switch controlled by TXEN (PA0) and RXEN (PA1)
+- WCH USB-serial (CH340-compatible) for flashing, upload via `stm32flash`
+- No built-in OLED
+
+Pinout verified from the DX-LR30 development board manual:
+
+```
+SPI1 (LoRa):    SCK=PA5  MISO=PA6  MOSI=PA7
+SX1262 control: NSS=PA4  DIO1=PC15  RST=PA15  BUSY=PA14(=JTCK)
+RF switch:      TXEN=PA0  RXEN=PA1
+Relay outputs:  IN1=PB3(=JTDO)  IN2=PB4(=NJTRST)
+Serial:         TX=PA9  RX=PA10
+LED:            PC13 (active LOW)
+VBAT:           PA3
+```
+
+> PB3, PB4, PA14 are JTAG pins. The firmware calls
+> `loraDisableJtag()` in `setup()` (via `__HAL_AFIO_REMAP_SWJ_DISABLE()`) to
+> free them as GPIO before any `pinMode`/`digitalWrite`. Serial flashing only
+> after this point (SWD is also released).
 
 ### Sensors
 
@@ -354,11 +472,45 @@ LoRa pinout internal to the board (already wired on the PCB, exposed via
 OLED pinout internal (I2C):
 `SDA=21  SCL=22  RST=16`
 
+### Actuator wiring
+
+**ESP32 variant** (`prises-actuator`, LILYGO LoRa32 T3 V1.6.1):
+
+```
+   LILYGO T3 V1.6.1 (actuator)     2-ch relay module (5V)
+   ────────────────────────────     ──────────────────────
+            5V o──────────────────o VCC
+           GND o──────────────────o GND
+          IO32 o──────────────────o IN1
+          IO33 o──────────────────o IN2
+```
+
+`RELAY1_PIN=32  RELAY2_PIN=33`  (defaults; overridable via `build_flags`)
+
+**STM32 variant** (`prises-actuator-dx-lr30`, DX-LR30 module):
+
+```
+   DX-LR30 (actuator)               2-ch relay module (5V)
+   ──────────────────               ──────────────────────
+            3.3V or 5V o──────────o VCC
+                  GND  o──────────o GND
+                  PB3  o──────────o IN1
+                  PB4  o──────────o IN2
+```
+
+`RELAY1_PIN=PB3  RELAY2_PIN=PB4` — freed from JTAG by `loraDisableJtag()`.
+
+**Relay module polarity**: configurable per channel via `RELAY1_ACTIVE_LOW`
+and `RELAY2_ACTIVE_LOW` build flags (`0` = active-HIGH, `1` = active-LOW).
+The two channels of a given module may have different polarity — set each flag
+independently. If only `RELAY_ACTIVE_LOW` is defined, both channels inherit it.
+
 ### OLED display
 
-OLED controlled by `WITH_OLED=1` in `platformio.ini` (both envs). If the
-board does not have a soldered OLED, set to `0` or omit — the code I2C-probes
-at 0x3C and disables the display cleanly.
+OLED controlled by `WITH_OLED=1` in `platformio.ini`. If the board does not
+have a soldered OLED, set to `0` or omit — the code I2C-probes at 0x3C and
+disables the display cleanly. The DX-LR30 has no OLED; `WITH_OLED` is not
+set for that target.
 
 **Emitter**: every cycle (1 s):
 
@@ -377,6 +529,19 @@ at 0x3C and disables the display cleanly.
 - Failed distance → `----`, OR last known value with `?` if <30 s
 - No DS18B20 (disconnected/init failure) → temp omitted from footer
 - LoRa init failed → `LoRa ERR` top right, TX skipped
+
+**Actuator** (`prises-actuator`, ESP32 only):
+
+```
+┌────────────────────────────┐
+│ Prises actuateur  LoRa OK  │
+│────────────────────────────│
+│ Relay1: ON                 │
+│ Relay2: OFF                │
+│────────────────────────────│
+│ TX #5   cmd 3s ago         │   ◄── seq + age of last received command
+└────────────────────────────┘
+```
 
 **Gateway**: refresh every 500 ms:
 
@@ -413,6 +578,10 @@ packets are arriving without having to look at HA.
 - Frequency: **868.1 MHz**
 - CRC enabled
 - TX cadence is **runtime-configurable** by the gateway (see *Runtime config sync* below); the emitter persists the chosen value in NVS
+- **CSMA/CAD** (`loraTx()` in `lora_board.h`): every TX call runs a channel
+  activity detection scan before transmitting. If the channel is busy, a
+  random 20-120 ms backoff is applied, then the packet is transmitted. Prevents
+  blind collisions when two nodes are close in time.
 
 ### Runtime config sync (gateway → emitter)
 
@@ -456,42 +625,61 @@ Power-budget rules of thumb (LILYGO T3 V1.6.1, OLED on, no power-gating):
 
 ## Home Assistant integration
 
-- Native MQTT auto-discovery: entities appear in HA on the 1st packet from a new emitter
-- **Primary entities** (foreground):
-  - `tank_pct` — % filled (0-100)
-  - `water_temp_c` — water temperature (°C, DS18B20 if connected)
-- **Diagnostic entities** (grouped in the HA "Diagnostic" section):
-  - `tank_cm` — raw ultrasonic distance (may be `null` when tank is full, see null=full rule)
-  - `rssi`, `snr` — LoRa link quality
-- **Config entities** under the "Jardin Gateway" device:
-  - `Tank empty distance` (number, 0-200 cm)
-  - `Tank full distance` (number, 0-200 cm)
-  - `Cuve TX interval` (number, 5-3600 s) — pushed to the emitter on its next `cfg_req` round-trip, persisted in NVS
-- **Availability**:
-  - Per-node: `jardin/<node>/availability` (offline if no packet for 3 min)
-  - Gateway: MQTT LWT on `jardin/gateway/availability`
-  - If the emitter dies → all node entities go unavailable
-  - If the DS18B20 is missing but the emitter works → only `water_temp_c` goes unavailable, the rest keeps going
-- **Automations to create on the HA side**:
-  - "Tank low" notification on `tank_pct < 20`
-  - "Tank full" notification on `tank_pct >= 100` (transition)
-  - "Emitter offline for X min" alert
-  - Optional: temperature alert (frost `<2°C`, indicative overheat `>30°C`)
+Native MQTT auto-discovery: entities appear in HA on the first packet from
+any new node.
+
+### Cuve emitter device
+
+- **Primary entities**: `tank_pct` (% filled), `water_temp_c` (°C)
+- **Diagnostic entities**: `tank_cm` (raw distance, may be `null` = full),
+  `rssi`, `snr`, `vbat`
+
+### Prises actuator device
+
+- **Switch entities (primary)**: `Prise 1`, `Prise 2` (`device_class: outlet`) —
+  toggle from HA, state reflects the actuator's confirmed relay state with
+  optimistic intermediate updates
+- **Diagnostic entities**: `vbat`, `rssi`, `snr`
+
+### Jardin Gateway device (config)
+
+- `Tank empty distance` (number, 0-200 cm)
+- `Tank full distance` (number, 0-200 cm)
+- `Cuve TX interval` (number, 5-3600 s) — pushed to the emitter on its next
+  `cfg_req` round-trip, persisted in NVS
+
+### Availability
+
+- Per-node: `jardin/<node>/availability` — goes `offline` after 3 min without a packet
+- Gateway: MQTT LWT on `jardin/gateway/availability`
+- If the emitter dies → all cuve entities go unavailable
+- If the DS18B20 is missing but the emitter works → only `water_temp_c` goes unavailable
+
+### Suggested automations
+
+- "Tank low" notification on `tank_pct < 20`
+- "Tank full" notification on `tank_pct >= 100` (transition)
+- "Emitter / actuator offline" alert
+- Temperature alert (frost `<2°C`, indicative overheat `>30°C`)
 
 ## Repo structure
 
 ```
 .
 ├── README.md
-├── CLAUDE.md           rules for Claude Code
-├── LICENSE             GPL v3
-├── platformio.ini      two envs: emitter, gateway
-├── secrets.example.ini template to copy to secrets.ini (gitignore)
+├── CLAUDE.md                   rules for Claude Code
+├── LICENSE                     GPL v3
+├── platformio.ini              all firmware envs
+├── secrets.example.ini         template to copy to secrets.ini (gitignore)
 ├── include/
-│   └── auth.h          HMAC-SHA256 + verify (header-only, shared emitter/gateway)
-├── cuve-emitter/src/   firmware sensor node (garden, tank ultrasonic + temp)
-├── gateway/src/        firmware gateway (house)
-└── hardware/           wiring schematics, enclosure STLs (TODO)
+│   ├── auth.h                  HMAC-SHA256 + verify (header-only, all targets)
+│   ├── lora_board.h            RadioLib init + helpers (SX1276 / SX1262)
+│   └── wdt.h                   watchdog abstraction (ESP32 + STM32 no-op stubs)
+├── cuve-emitter/src/           firmware: tank emitter (garden, ESP32)
+├── gateway/src/                firmware: gateway (house, ESP32)
+├── prises-actuator/src/        firmware: relay actuator (garden, ESP32)
+├── prises-actuator-dx-lr30/src/ firmware: relay actuator (garden, STM32F103)
+└── hardware/                   wiring schematics, enclosure STLs (TODO)
 ```
 
 ## Setup
@@ -508,15 +696,30 @@ openssl rand -hex 32
 
 # 3. Also edit the [wifi] and [mqtt] sections with your real credentials
 
-# Tank emitter
+# Tank emitter (continuous or battery/solar variant)
 pio run -e cuve-emitter
 pio run -e cuve-emitter -t upload
 pio device monitor -e cuve-emitter
+# pio run -e cuve-emitter-battery -t upload   # deep-sleep variant
 
-# Gateway (the same [lora] key must be present, otherwise packets get dropped)
+# Gateway
 pio run -e gateway
 pio run -e gateway -t upload
 pio device monitor -e gateway
+
+# Relay actuator — ESP32 variant
+pio run -e prises-actuator
+pio run -e prises-actuator -t upload
+pio device monitor -e prises-actuator
+
+# Relay actuator — DX-LR30 (STM32F103) variant
+# Adjust upload_port in platformio.ini to match your /dev/cu.wchusbserial* device.
+# Two-step flash (stm32flash -i resets to bootloader, second call writes):
+pio run -e prises-actuator-dx-lr30
+stm32flash -i rts,-dtr,dtr:-rts,-dtr,dtr -b 115200 /dev/cu.wchusbserial10
+stm32flash -b 115200 -w .pio/build/prises-actuator-dx-lr30/firmware.bin \
+           -v /dev/cu.wchusbserial10
+pio device monitor -e prises-actuator-dx-lr30
 ```
 
 Without a complete `secrets.ini`, the build fails with clear messages
@@ -542,18 +745,25 @@ LORA_PSK undefined`).
 - [x] **HMAC-SHA256 + anti-replay seq** on the LoRa link (auth + integrity)
 - [x] Bidirectional LoRa: emitter pulls `tx_interval_s` from gateway via `cfg_req`/ack, persists in NVS
 - [x] Deep-sleep mode for battery/solar deployment (build flag `WITH_DEEP_SLEEP=1`)
+- [x] **Relay actuator** (ESP32 + STM32/DX-LR30 variants): LoRa command/heartbeat, NVS/EEPROM persistence, per-channel polarity, HA switch entities
+- [x] Gateway optimistic relay publish + timeout retry (`RELAY_CMD_RETRY_MS=2500ms`) for reliable HA reactivity
+- [x] Migrated radio stack from sandeepmistry/LoRa to jgromes/RadioLib (SX1276 + SX1262 support)
+- [x] **CSMA/CAD**: `loraTx()` wrapper in `lora_board.h` — pre-TX channel scan + random backoff before every transmit across all firmwares
+- [x] **Actuator restore on reboot**: `restore_req:1` in first heartbeat; gateway re-applies state per **Power-on behavior** select entity (`previous` / `on` / `off` / `toggle`)
+- [x] HA switch `device_class: outlet` for relay switch entities
 
 ### Software (possibly later)
 - [ ] AES-128 on the LoRa payload for confidentiality (HMAC alone does not encrypt)
-- [ ] Interrupt-driven LoRa RX instead of polling (if needed after testing)
 - [ ] Time smoothing on the gateway side (moving average over the last N valid `tank_cm`)
 - [ ] HA `number` for thermal offset if drift observed vs reference
 
 ### Hardware
 - [x] Emitter wiring documented (LILYGO T3 V1.6.1 + SR04M-2 + voltage divider + 22 µF)
 - [x] DS18B20 wiring documented (1-Wire + 4.7 kΩ pull-up)
+- [x] Actuator wiring documented (relay module, ESP32 + DX-LR30 pinout)
 - [ ] 3D enclosure for emitter (IP65, cable glands for power + sensor exits)
 - [ ] 3D enclosure for gateway (indoor)
+- [ ] 3D enclosure for actuator
 - [ ] House ↔ garden range tests
 
 ### Doc

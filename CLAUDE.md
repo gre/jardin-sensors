@@ -71,6 +71,30 @@ pio run -e gateway -t upload
 pio device monitor -e gateway
 ```
 
+## Flashing the DX-LR30 (prises-actuator-dx-lr30)
+
+The upload port changes every time the device is reconnected. Always check
+first: `ls /dev/cu.wchusbserial*` and update `upload_port` in `platformio.ini`.
+
+`pio run -e prises-actuator-dx-lr30 -t upload` works automatically via
+`stm32_upload_reset.py` (pyserial pre-upload script): it opens the port,
+asserts `rts=True` (BOOT0 HIGH) + `dtr=False` (NRST LOW), releases NRST,
+waits 300 ms, then closes so stm32flash can connect cleanly.
+
+**Why the script is needed**: the DX-LR30 has NPN transistors inverting
+DTR/RTS before NRST/BOOT0. The stm32flash `-i` flag alone is unreliable
+(GPIO sequence runs but bootloader handshake fails intermittently). The
+pyserial approach is stable.
+
+**Manual fallback** (if pyserial is missing):
+```
+# 1. Enter bootloader: hold BOOT0, press+release RESET, keep holding BOOT0
+# 2. Then immediately:
+~/.platformio/packages/tool-stm32flash/stm32flash \
+  -b 115200 -w .pio/build/prises-actuator-dx-lr30/firmware.bin \
+  -v /dev/cu.wchusbserial<N>
+```
+
 ## Architecture: emitter dumb, gateway smart
 
 Structural rule of the project, to follow for any new sensor or field.
