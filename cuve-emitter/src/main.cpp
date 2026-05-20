@@ -218,14 +218,17 @@ static void sensorInit() {
 }
 
 static float readDistanceCm() {
-  digitalWrite(US_TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(US_TRIG_PIN, HIGH);
-  delayMicroseconds(US_TRIG_PULSE_US);
-  digitalWrite(US_TRIG_PIN, LOW);
-  unsigned long us = pulseIn(US_ECHO_PIN, HIGH, US_TIMEOUT_US);
-  if (us == 0) return NAN;
-  return us / 58.0f;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) delay(20);
+    digitalWrite(US_TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(US_TRIG_PIN, HIGH);
+    delayMicroseconds(US_TRIG_PULSE_US);
+    digitalWrite(US_TRIG_PIN, LOW);
+    unsigned long us = pulseIn(US_ECHO_PIN, HIGH, US_TIMEOUT_US);
+    if (us > 0) return us / 58.0f;
+  }
+  return NAN;
 }
 
 static void tempInit() {
@@ -249,7 +252,11 @@ static void tempInit() {
 //   garden water, so we treat it as a read bug.
 static float readWaterTempC() {
   if (!tempReady) return NAN;
-  if ((millis() - tempRequestMs) < 400) return NAN;
+  // Block for the remainder of the 11-bit conversion window (~375 ms).
+  // In the loop path elapsed >> 400 ms so no delay is added; in the
+  // deep-sleep path setup() calls tempInit() ~130 ms before sendSample().
+  uint32_t elapsed = millis() - tempRequestMs;
+  if (elapsed < 400) delay(400 - elapsed);
   float t = tempSensor.getTempCByIndex(0);
   tempSensor.requestTemperatures();
   tempRequestMs = millis();
@@ -377,6 +384,11 @@ static void enterDeepSleep() {
   Serial.printf("[emitter] deep sleep %us\n",
                 static_cast<unsigned>(txIntervalS));
   Serial.flush();
+#if WITH_OLED
+  // SSD1306 stays powered on the 3.3V rail during deep sleep; explicit power-off
+  // prevents the screen from staying lit the whole sleep interval.
+  if (oledPresent) oled.setPowerSave(1);
+#endif
   // Park the SX1276 in STDBY before yanking power: empties FIFOs and avoids
   // a half-finished TX leaking into the next boot's first packet.
   if (loraReady) loraRadio.sleep();
