@@ -38,6 +38,40 @@
 #define TX_INTERVAL_S_MAX 3600
 #endif
 
+// Minimum time from boot to first sensor read. Lets the rail and sensors
+// stabilize after a deep-sleep wake transient. Configurable from HA.
+#ifndef BOOT_DELAY_MS_DEFAULT
+#define BOOT_DELAY_MS_DEFAULT 1000
+#endif
+#ifndef BOOT_DELAY_MS_MIN
+#define BOOT_DELAY_MS_MIN 0
+#endif
+#ifndef BOOT_DELAY_MS_MAX
+#define BOOT_DELAY_MS_MAX 5000
+#endif
+
+// Ultrasonic read attempts per cycle. Configurable from HA.
+#ifndef US_RETRIES_DEFAULT
+#define US_RETRIES_DEFAULT 3
+#endif
+#ifndef US_RETRIES_MIN
+#define US_RETRIES_MIN 1
+#endif
+#ifndef US_RETRIES_MAX
+#define US_RETRIES_MAX 10
+#endif
+
+// DS18B20 conversion attempts per cycle. Configurable from HA.
+#ifndef TEMP_RETRIES_DEFAULT
+#define TEMP_RETRIES_DEFAULT 2
+#endif
+#ifndef TEMP_RETRIES_MIN
+#define TEMP_RETRIES_MIN 1
+#endif
+#ifndef TEMP_RETRIES_MAX
+#define TEMP_RETRIES_MAX 5
+#endif
+
 // Re-ask the gateway for config every ~1h, plus on every fresh power-up.
 #ifndef CFG_REFRESH_S
 #define CFG_REFRESH_S 3600
@@ -52,8 +86,14 @@
 #define WITH_DEEP_SLEEP 0
 #endif
 
-#ifndef OLED_BOOT_DISPLAY_MS
-#define OLED_BOOT_DISPLAY_MS 10000
+#ifndef OLED_DISPLAY_MS_DEFAULT
+#define OLED_DISPLAY_MS_DEFAULT 10000
+#endif
+#ifndef OLED_DISPLAY_MS_MIN
+#define OLED_DISPLAY_MS_MIN 0
+#endif
+#ifndef OLED_DISPLAY_MS_MAX
+#define OLED_DISPLAY_MS_MAX 30000
 #endif
 
 // SR04M-2 in mode 0 (TTL pulse): RX=TRIG (sensor input), TX=ECHO (output).
@@ -106,7 +146,11 @@ RTC_DATA_ATTR static uint32_t rtcSeq = 0;
 RTC_DATA_ATTR static uint32_t rtcCfgAccumS = 0xFFFFFFFFu;
 
 static Preferences prefs;
-static uint32_t txIntervalS = TX_INTERVAL_S_DEFAULT;
+static uint32_t txIntervalS   = TX_INTERVAL_S_DEFAULT;
+static uint32_t bootDelayMs   = BOOT_DELAY_MS_DEFAULT;
+static uint32_t oledDisplayMs = OLED_DISPLAY_MS_DEFAULT;
+static uint8_t  usRetries     = US_RETRIES_DEFAULT;
+static uint8_t  tempRetries   = TEMP_RETRIES_DEFAULT;
 
 static bool loraReady = false;
 static float lastValidDistanceCm = NAN;
@@ -119,21 +163,44 @@ static uint32_t tempRequestMs = 0;
 
 static void loadSettings() {
   prefs.begin("emitter", true);
-  txIntervalS = prefs.getUInt("tx_int_s", TX_INTERVAL_S_DEFAULT);
+  txIntervalS   = prefs.getUInt("tx_int_s",    TX_INTERVAL_S_DEFAULT);
+  bootDelayMs   = prefs.getUInt("boot_dly_ms", BOOT_DELAY_MS_DEFAULT);
+  oledDisplayMs = prefs.getUInt("oled_disp_ms", OLED_DISPLAY_MS_DEFAULT);
+  usRetries     = prefs.getUChar("us_retries",   US_RETRIES_DEFAULT);
+  tempRetries   = prefs.getUChar("temp_retries", TEMP_RETRIES_DEFAULT);
   prefs.end();
-  if (txIntervalS < TX_INTERVAL_S_MIN || txIntervalS > TX_INTERVAL_S_MAX) {
+  if (txIntervalS < TX_INTERVAL_S_MIN || txIntervalS > TX_INTERVAL_S_MAX)
     txIntervalS = TX_INTERVAL_S_DEFAULT;
-  }
-  Serial.printf("[emitter] settings loaded: tx_interval_s=%u\n",
-                static_cast<unsigned>(txIntervalS));
+  if (bootDelayMs > BOOT_DELAY_MS_MAX)
+    bootDelayMs = BOOT_DELAY_MS_DEFAULT;
+  if (oledDisplayMs > OLED_DISPLAY_MS_MAX)
+    oledDisplayMs = OLED_DISPLAY_MS_DEFAULT;
+  if (usRetries < US_RETRIES_MIN || usRetries > US_RETRIES_MAX)
+    usRetries = US_RETRIES_DEFAULT;
+  if (tempRetries < TEMP_RETRIES_MIN || tempRetries > TEMP_RETRIES_MAX)
+    tempRetries = TEMP_RETRIES_DEFAULT;
+  Serial.printf("[emitter] settings loaded: tx_int=%u boot_dly=%u oled_ms=%u us_ret=%u temp_ret=%u\n",
+                static_cast<unsigned>(txIntervalS),
+                static_cast<unsigned>(bootDelayMs),
+                static_cast<unsigned>(oledDisplayMs),
+                static_cast<unsigned>(usRetries),
+                static_cast<unsigned>(tempRetries));
 }
 
 static void saveSettings() {
   prefs.begin("emitter", false);
-  prefs.putUInt("tx_int_s", txIntervalS);
+  prefs.putUInt("tx_int_s",      txIntervalS);
+  prefs.putUInt("boot_dly_ms",   bootDelayMs);
+  prefs.putUInt("oled_disp_ms",  oledDisplayMs);
+  prefs.putUChar("us_retries",   usRetries);
+  prefs.putUChar("temp_retries", tempRetries);
   prefs.end();
-  Serial.printf("[emitter] settings saved: tx_interval_s=%u\n",
-                static_cast<unsigned>(txIntervalS));
+  Serial.printf("[emitter] settings saved: tx_int=%u boot_dly=%u oled_ms=%u us_ret=%u temp_ret=%u\n",
+                static_cast<unsigned>(txIntervalS),
+                static_cast<unsigned>(bootDelayMs),
+                static_cast<unsigned>(oledDisplayMs),
+                static_cast<unsigned>(usRetries),
+                static_cast<unsigned>(tempRetries));
 }
 
 static void loraInit() {
@@ -218,7 +285,7 @@ static void sensorInit() {
 }
 
 static float readDistanceCm() {
-  for (int attempt = 0; attempt < 3; attempt++) {
+  for (int attempt = 0; attempt < usRetries; attempt++) {
     if (attempt > 0) delay(20);
     digitalWrite(US_TRIG_PIN, LOW);
     delayMicroseconds(2);
@@ -252,16 +319,32 @@ static void tempInit() {
 //   garden water, so we treat it as a read bug.
 static float readWaterTempC() {
   if (!tempReady) return NAN;
-  // Block for the remainder of the 11-bit conversion window (~375 ms).
-  // In the loop path elapsed >> 400 ms so no delay is added; in the
-  // deep-sleep path setup() calls tempInit() ~130 ms before sendSample().
-  uint32_t elapsed = millis() - tempRequestMs;
-  if (elapsed < 400) delay(400 - elapsed);
-  float t = tempSensor.getTempCByIndex(0);
-  tempSensor.requestTemperatures();
-  tempRequestMs = millis();
-  if (t == DEVICE_DISCONNECTED_C || t >= 85.0f) return NAN;
-  return t;
+  // Retry loop catches the 85 °C power-on sentinel and DEVICE_DISCONNECTED
+  // transients on the first read after a deep-sleep wake. Each attempt blocks
+  // for the remainder of the 11-bit conversion window (~375 ms).
+  for (int attempt = 0; attempt < tempRetries; attempt++) {
+    uint32_t elapsed = millis() - tempRequestMs;
+    if (elapsed < 400) delay(400 - elapsed);
+    float t = tempSensor.getTempCByIndex(0);
+    if (t != DEVICE_DISCONNECTED_C && t < 85.0f) return t;
+    if (attempt + 1 < tempRetries) {
+      tempSensor.requestTemperatures();
+      tempRequestMs = millis();
+    }
+  }
+  return NAN;
+}
+
+template<typename T>
+static bool applyCfgField(JsonObject& cfg, const char* key,
+                           T& var, T lo, T hi) {
+  if (!cfg[key].is<unsigned int>() && !cfg[key].is<int>()) return false;
+  T v = cfg[key].as<T>();
+  if (v < lo || v > hi || v == var) return false;
+  Serial.printf("[emitter] %s %u -> %u\n", key,
+                static_cast<unsigned>(var), static_cast<unsigned>(v));
+  var = v;
+  return true;
 }
 
 // Listen for a gateway config response addressed to us, echoing reqSeq.
@@ -296,21 +379,18 @@ static bool tryReceiveConfig(uint32_t reqSeq) {
     if (!doc["cfg"].is<JsonObject>()) continue;
     JsonObject cfg = doc["cfg"].as<JsonObject>();
     bool changed = false;
-    if (cfg["tx_interval_s"].is<unsigned int>() ||
-        cfg["tx_interval_s"].is<int>()) {
-      uint32_t v = cfg["tx_interval_s"].as<uint32_t>();
-      if (v >= TX_INTERVAL_S_MIN && v <= TX_INTERVAL_S_MAX && v != txIntervalS) {
-        Serial.printf("[emitter] tx_interval_s %u -> %u\n",
-                      static_cast<unsigned>(txIntervalS),
-                      static_cast<unsigned>(v));
-        txIntervalS = v;
-        changed = true;
-      }
-    }
+    changed |= applyCfgField<uint32_t>(cfg, "tx_interval_s",
+                                        txIntervalS, TX_INTERVAL_S_MIN,  TX_INTERVAL_S_MAX);
+    changed |= applyCfgField<uint32_t>(cfg, "boot_delay_ms",
+                                        bootDelayMs,  BOOT_DELAY_MS_MIN,  BOOT_DELAY_MS_MAX);
+    changed |= applyCfgField<uint8_t> (cfg, "us_retries",
+                                        usRetries,    US_RETRIES_MIN,     US_RETRIES_MAX);
+    changed |= applyCfgField<uint8_t> (cfg, "temp_retries",
+                                        tempRetries,    TEMP_RETRIES_MIN,     TEMP_RETRIES_MAX);
+    changed |= applyCfgField<uint32_t>(cfg, "oled_display_ms",
+                                        oledDisplayMs,  OLED_DISPLAY_MS_MIN,  OLED_DISPLAY_MS_MAX);
     if (changed) saveSettings();
-    Serial.printf("[emitter] cfg ACK seq=%u tx_interval_s=%u\n",
-                  static_cast<unsigned>(reqSeq),
-                  static_cast<unsigned>(txIntervalS));
+    Serial.printf("[emitter] cfg ACK seq=%u\n", static_cast<unsigned>(reqSeq));
     return true;
   }
   Serial.printf("[emitter] cfg ACK timeout for seq=%u\n",
@@ -327,7 +407,10 @@ static void sendSample() {
   float waterTemp = readWaterTempC();
   float vbat = readVbatVolts();
   uint32_t s = rtcSeq++;
-  bool wantCfg = rtcCfgAccumS >= CFG_REFRESH_S;
+  // Always request config for the first 5 packets (covers missed ACK on boot 0).
+  // s < 5: retry cfg_req for the first 5 cycles after power-on, but only
+  // while rtcCfgAccumS != 0 (i.e., no ACK received yet this power cycle).
+  bool wantCfg = (rtcCfgAccumS >= CFG_REFRESH_S) || (s < 5 && rtcCfgAccumS != 0);
 
   JsonDocument doc;
   doc["node"] = NODE_ID;
@@ -384,6 +467,7 @@ static void enterDeepSleep() {
   Serial.printf("[emitter] deep sleep %us\n",
                 static_cast<unsigned>(txIntervalS));
   Serial.flush();
+  digitalWrite(US_TRIG_PIN, LOW);
 #if WITH_OLED
   // SSD1306 stays powered on the 3.3V rail during deep sleep; explicit power-off
   // prevents the screen from staying lit the whole sleep interval.
@@ -430,10 +514,16 @@ void setup() {
                 oledStatus);
 
 #if WITH_DEEP_SLEEP
+  {
+    // Ensure bootDelayMs ms have elapsed since power-on before the first
+    // sensor read; accounts for time already spent in init.
+    uint32_t elapsed = millis();
+    if (elapsed < bootDelayMs) delay(bootDelayMs - elapsed);
+  }
   sendSample();
 #if WITH_OLED
   if (oledPresent) {
-    delay(OLED_BOOT_DISPLAY_MS);
+    delay(oledDisplayMs);
   }
 #endif
   enterDeepSleep();

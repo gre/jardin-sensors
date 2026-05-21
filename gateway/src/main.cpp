@@ -118,6 +118,56 @@ static_assert(TANK_EMPTY_DISTANCE_CM > TANK_FULL_DISTANCE_CM,
 #define CUVE_TX_INTERVAL_S_MAX 3600
 #endif
 
+// Minimum ms from boot to first sensor read on the emitter (stabilization).
+// Must match cuve-emitter's BOOT_DELAY_MS_{MIN,MAX}.
+#ifndef CUVE_BOOT_DELAY_MS_DEFAULT
+#define CUVE_BOOT_DELAY_MS_DEFAULT 1000
+#endif
+#ifndef CUVE_BOOT_DELAY_MS_MIN
+#define CUVE_BOOT_DELAY_MS_MIN 0
+#endif
+#ifndef CUVE_BOOT_DELAY_MS_MAX
+#define CUVE_BOOT_DELAY_MS_MAX 5000
+#endif
+
+// Ultrasonic read attempts. Must match cuve-emitter's US_RETRIES_{MIN,MAX}.
+#ifndef CUVE_US_RETRIES_DEFAULT
+#define CUVE_US_RETRIES_DEFAULT 3
+#endif
+#ifndef CUVE_US_RETRIES_MIN
+#define CUVE_US_RETRIES_MIN 1
+#endif
+#ifndef CUVE_US_RETRIES_MAX
+#define CUVE_US_RETRIES_MAX 10
+#endif
+
+// DS18B20 conversion attempts. Must match cuve-emitter's TEMP_RETRIES_{MIN,MAX}.
+#ifndef CUVE_TEMP_RETRIES_DEFAULT
+#define CUVE_TEMP_RETRIES_DEFAULT 2
+#endif
+#ifndef CUVE_TEMP_RETRIES_MIN
+#define CUVE_TEMP_RETRIES_MIN 1
+#endif
+#ifndef CUVE_TEMP_RETRIES_MAX
+#define CUVE_TEMP_RETRIES_MAX 5
+#endif
+
+// OLED display duration on the emitter after each wake. Must match cuve-emitter's OLED_DISPLAY_MS_{MIN,MAX}.
+#ifndef CUVE_OLED_DISPLAY_MS_DEFAULT
+#define CUVE_OLED_DISPLAY_MS_DEFAULT 10000
+#endif
+#ifndef CUVE_OLED_DISPLAY_MS_MIN
+#define CUVE_OLED_DISPLAY_MS_MIN 0
+#endif
+#ifndef CUVE_OLED_DISPLAY_MS_MAX
+#define CUVE_OLED_DISPLAY_MS_MAX 30000
+#endif
+
+// Voltage below which the emitter is considered low-battery.
+#ifndef VBAT_LOW_V
+#define VBAT_LOW_V 3.5f
+#endif
+
 // Persist anti-replay state per node every N packets, to bound flash wear.
 // Worst case after a gateway crash: an attacker can replay up to (this many)
 // past packets within their freshness window. 25 @ 60-s cadence = 25 min.
@@ -125,9 +175,13 @@ static_assert(TANK_EMPTY_DISTANCE_CM > TANK_FULL_DISTANCE_CM,
 #define SEQ_PERSIST_EVERY 5
 #endif
 
-static int g_tankEmptyCm     = TANK_EMPTY_DISTANCE_CM;
-static int g_tankFullCm      = TANK_FULL_DISTANCE_CM;
-static int g_cuveTxIntervalS = CUVE_TX_INTERVAL_S_DEFAULT;
+static int g_tankEmptyCm      = TANK_EMPTY_DISTANCE_CM;
+static int g_tankFullCm       = TANK_FULL_DISTANCE_CM;
+static int g_cuveTxIntervalS  = CUVE_TX_INTERVAL_S_DEFAULT;
+static int g_cuveBootDelayMs   = CUVE_BOOT_DELAY_MS_DEFAULT;
+static int g_cuveUsRetries     = CUVE_US_RETRIES_DEFAULT;
+static int g_cuveTempRetries   = CUVE_TEMP_RETRIES_DEFAULT;
+static int g_cuveOledDisplayMs = CUVE_OLED_DISPLAY_MS_DEFAULT;
 
 #ifndef ACTUATOR_NODE_ID
 #define ACTUATOR_NODE_ID "prises"
@@ -306,10 +360,18 @@ struct GwConfig {
 };
 
 static const GwConfig GW_CONFIG[] = {
-  {"tank_empty_cm",      "Tank empty distance", "cm", 0, TANK_DISTANCE_MAX_CM, &g_tankEmptyCm},
-  {"tank_full_cm",       "Tank full distance",  "cm", 0, TANK_DISTANCE_MAX_CM, &g_tankFullCm},
-  {"cuve_tx_interval_s", "Cuve TX interval",    "s",
-   CUVE_TX_INTERVAL_S_MIN, CUVE_TX_INTERVAL_S_MAX, &g_cuveTxIntervalS},
+  {"tank_empty_cm",        "Tank empty distance",    "cm", 0, TANK_DISTANCE_MAX_CM, &g_tankEmptyCm},
+  {"tank_full_cm",         "Tank full distance",     "cm", 0, TANK_DISTANCE_MAX_CM, &g_tankFullCm},
+  {"cuve_tx_interval_s",   "Cuve TX interval",       "s",
+   CUVE_TX_INTERVAL_S_MIN,   CUVE_TX_INTERVAL_S_MAX,   &g_cuveTxIntervalS},
+  {"cuve_boot_delay_ms",   "Cuve boot delay",        "ms",
+   CUVE_BOOT_DELAY_MS_MIN,   CUVE_BOOT_DELAY_MS_MAX,   &g_cuveBootDelayMs},
+  {"cuve_us_retries",      "Cuve ultrasonic retries", "",
+   CUVE_US_RETRIES_MIN,      CUVE_US_RETRIES_MAX,      &g_cuveUsRetries},
+  {"cuve_temp_retries",    "Cuve temp retries",      "",
+   CUVE_TEMP_RETRIES_MIN,    CUVE_TEMP_RETRIES_MAX,    &g_cuveTempRetries},
+  {"cuve_oled_display_ms", "Cuve OLED display",      "ms",
+   CUVE_OLED_DISPLAY_MS_MIN, CUVE_OLED_DISPLAY_MS_MAX, &g_cuveOledDisplayMs},
 };
 constexpr size_t GW_CONFIG_N = sizeof(GW_CONFIG) / sizeof(GW_CONFIG[0]);
 
@@ -794,7 +856,41 @@ static void loadPowerOnBehavior() {
 }
 
 static bool publishDiscovery(const char* node) {
-  return publishSensorDiscoveries(node, HA_DEVICE_NAME, HA_SENSORS, HA_SENSORS_N);
+  bool ok = publishSensorDiscoveries(node, HA_DEVICE_NAME, HA_SENSORS, HA_SENSORS_N);
+
+  char stateTopic[96];  buildStateTopic(node, stateTopic, sizeof(stateTopic));
+  char availTopic[96];  buildAvailabilityTopic(node, availTopic, sizeof(availTopic));
+  char nodeId[64];      snprintf(nodeId, sizeof(nodeId), "%s-%s", MQTT_BASE_TOPIC, node);
+
+  JsonDocument doc;
+  doc["name"] = "Battery low";
+  char unique[80];
+  snprintf(unique, sizeof(unique), "%s-vbat_low", nodeId);
+  doc["unique_id"]              = unique;
+  doc["state_topic"]            = stateTopic;
+  doc["value_template"]         = "{{ value_json.vbat_low | string }}";
+  doc["device_class"]           = "battery";
+  doc["payload_on"]             = "1";
+  doc["payload_off"]            = "0";
+  doc["entity_category"]        = "diagnostic";
+  doc["availability_topic"]     = availTopic;
+  doc["payload_available"]      = "online";
+  doc["payload_not_available"]  = "offline";
+  doc["expire_after"]           = (NODE_TIMEOUT_MS / 1000UL) + 30UL;
+  JsonObject device = doc["device"].to<JsonObject>();
+  device["identifiers"].add(nodeId);
+  device["name"]         = HA_DEVICE_NAME;
+  device["model"]        = HA_DEVICE_MODEL;
+  device["manufacturer"] = HA_DEVICE_MANUFACTURER;
+
+  char topic[160];
+  snprintf(topic, sizeof(topic), "%s/binary_sensor/%s/config", HA_DISCOVERY_PREFIX, unique);
+  char buf[512];
+  size_t n = serializeJson(doc, buf, sizeof(buf));
+  bool bsOk = mqtt.publish(topic, reinterpret_cast<const uint8_t*>(buf), n, true);
+  Serial.printf("[gateway] HA binary_sensor %s len=%u ok=%d\n",
+                topic, static_cast<unsigned>(n), bsOk ? 1 : 0);
+  return ok && bsOk;
 }
 
 static void mqttInit() {
@@ -865,6 +961,9 @@ static void augmentDerived(JsonDocument& doc, NodeState& st) {
     doc["tank_cm"] = st.lastValidTankCm;
   }
 
+  if (!doc["vbat"].isNull())
+    doc["vbat_low"] = doc["vbat"].as<float>() < VBAT_LOW_V ? 1 : 0;
+
   if (g_tankEmptyCm == g_tankFullCm) return;
   // tank_cm null = surface within the sensor dead zone (~25 cm) = tank
   // considered full. This is intentional: the sensor is mounted at the top,
@@ -883,7 +982,11 @@ static void sendConfigTo(const char* node, uint32_t ackSeq) {
   doc["to"]  = node;
   doc["ack"] = ackSeq;
   JsonObject cfg = doc["cfg"].to<JsonObject>();
-  cfg["tx_interval_s"] = g_cuveTxIntervalS;
+  cfg["tx_interval_s"]   = g_cuveTxIntervalS;
+  cfg["boot_delay_ms"]   = g_cuveBootDelayMs;
+  cfg["us_retries"]      = g_cuveUsRetries;
+  cfg["temp_retries"]    = g_cuveTempRetries;
+  cfg["oled_display_ms"] = g_cuveOledDisplayMs;
 
   char buf[200];
   size_t n = serializeJson(doc, buf, sizeof(buf));
