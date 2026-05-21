@@ -988,7 +988,7 @@ static void sendConfigTo(const char* node, uint32_t ackSeq) {
   cfg["temp_retries"]    = g_cuveTempRetries;
   cfg["oled_display_ms"] = g_cuveOledDisplayMs;
 
-  char buf[200];
+  char buf[256];
   size_t n = serializeJson(doc, buf, sizeof(buf));
   n = authAppendMac(buf, n, sizeof(buf),
                     reinterpret_cast<const uint8_t*>(LORA_PSK),

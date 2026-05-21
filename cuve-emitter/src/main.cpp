@@ -326,11 +326,9 @@ static float readWaterTempC() {
     uint32_t elapsed = millis() - tempRequestMs;
     if (elapsed < 400) delay(400 - elapsed);
     float t = tempSensor.getTempCByIndex(0);
+    tempSensor.requestTemperatures();
+    tempRequestMs = millis();
     if (t != DEVICE_DISCONNECTED_C && t < 85.0f) return t;
-    if (attempt + 1 < tempRetries) {
-      tempSensor.requestTemperatures();
-      tempRequestMs = millis();
-    }
   }
   return NAN;
 }

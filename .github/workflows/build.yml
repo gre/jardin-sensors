@@ -32,11 +32,8 @@ jobs:
         # them at runtime. Copying the example unblocks the #error guards.
         run: cp secrets.example.ini secrets.ini
 
-      - name: Build cuve-emitter (mains/dev)
+      - name: Build cuve-emitter
         run: pio run -e cuve-emitter
-
-      - name: Build cuve-emitter-battery
-        run: pio run -e cuve-emitter-battery
 
       - name: Build prises-actuator
         run: pio run -e prises-actuator
