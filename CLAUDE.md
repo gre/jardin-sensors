@@ -18,7 +18,7 @@ Connected garden, LoRa point-to-point + Home Assistant via MQTT.
 - **LILYGO T3 V1.6.1 OLED quirk**: do not software-pulse GPIO 16 (OLED_RST).
   On some variants, touching GPIO 16 resets the chip. The U8g2 constructor
   must use `U8X8_PIN_NONE` for the reset pin.
-- Radio: 868.1 MHz, lib `sandeepmistry/LoRa`
+- Radio: 868.1 MHz, lib `jgromes/RadioLib` (~7.0.0)
 - **LoRa auth**: HMAC-SHA256 truncated to 8 bytes on each packet, anti-replay
   via monotonic `seq` per node. Pre-shared key `LORA_PSK` in `secrets.ini`
   section `[lora]`, identical on emitter and gateway. Helpers in
@@ -46,11 +46,15 @@ Connected garden, LoRa point-to-point + Home Assistant via MQTT.
 ## Layout
 
 ```
-cuve-emitter/src/main.cpp   firmware sensor node (garden)
-gateway/src/main.cpp   firmware gateway (house): LoRa RX -> MQTT
-include/auth.h         HMAC-SHA256 + verify (header-only, shared emitter/gw)
+cuve-emitter/src/main.cpp          firmware sensor node (garden, ESP32)
+prises-actuator/src/main.cpp       firmware relay actuator (garden, ESP32)
+prises-actuator-dx-lr30/src/main.cpp  firmware relay actuator (DX-LR30, STM32F103)
+gateway/src/main.cpp               firmware gateway (house, ESP32): LoRa RX -> MQTT
+include/auth.h         HMAC-SHA256 + verify (header-only, shared)
+include/lora_board.h   RadioLib init + helpers for SX1276 (ESP32) and SX1262 (DX-LR30)
+include/wdt.h          watchdog helper (header-only)
 hardware/              wiring schematics, enclosure STLs (TODO)
-platformio.ini         two envs: emitter, gateway
+platformio.ini         four envs: cuve-emitter, prises-actuator, prises-actuator-dx-lr30, gateway
 secrets.example.ini    template (gitignore: secrets.ini)
 ```
 
@@ -65,6 +69,10 @@ with build_src_filter (which explicitly targets `cuve-emitter/src/` or
 pio run -e cuve-emitter
 pio run -e cuve-emitter -t upload
 pio device monitor -e cuve-emitter
+
+pio run -e prises-actuator
+pio run -e prises-actuator -t upload
+pio device monitor -e prises-actuator
 
 pio run -e gateway
 pio run -e gateway -t upload
@@ -140,10 +148,11 @@ Do not confuse `tank_cm: null` (tank full) with `availability: offline`
 - No comments explaining "what" the code does; names are enough. Only
   comment the "why" when it is non-obvious (workaround, hard constraint,
   subtle invariant).
-- LoRa pinout overridable via `build_flags` in `platformio.ini`
-  (`LORA_SCK`, `LORA_MISO`, `LORA_MOSI`, `LORA_SS`, `LORA_RST`, `LORA_DIO0`).
-  Defaults: LILYGO/TTGO LoRa32 v2.x family, to confirm on both real boards
-  before claiming "it works".
+- LoRa pinout overridable via `build_flags`. SX1276 (default, ESP32 boards):
+  `LORA_SCK`, `LORA_MISO`, `LORA_MOSI`, `LORA_SS`, `LORA_RST`, `LORA_DIO0`.
+  SX1262 (set `-DLORA_USE_SX1262=1`): `LORA_SS`, `LORA_DIO1`, `LORA_RST`,
+  `LORA_BUSY`; optionally `LORA_TXEN`, `LORA_RXEN` for external RF switch.
+  Defaults for SX1276: LILYGO/TTGO LoRa32 v2.x family.
 - `LORA_BAND=868100000UL` (Europe). Do not change without a regulatory
   reason.
 - ArduinoJson v7: use `JsonDocument` (not `StaticJsonDocument`, deprecated).
