@@ -9,6 +9,13 @@
 #include "wdt.h"
 #include "lora_board.h"
 
+#ifdef FLOWERCARE_MAC
+#include <NimBLEDevice.h>
+// Arduino 3.x releases BTDM memory in initArduino() unless btInUse() returns
+// true. NimBLE-Arduino 1.4.x doesn't set _btLibraryInUse, so override here.
+extern "C" bool btInUse() { return true; }
+#endif
+
 #ifndef LORA_PSK
 #error "LORA_PSK undefined: cp secrets.example.ini secrets.ini then fill in."
 #endif
@@ -126,6 +133,14 @@
 #define TEMP_RESOLUTION_BITS 11
 #endif
 
+#ifdef FLOWERCARE_MAC
+// Timeout for a single BLE connect attempt. Keep short so a missing
+// Flower Care doesn't add more than this many seconds to each wake cycle.
+#ifndef FLOWERCARE_CONNECT_TIMEOUT_S
+#define FLOWERCARE_CONNECT_TIMEOUT_S 5
+#endif
+#endif
+
 #if WITH_OLED
 // OLED SSD1306 0.96" on LILYGO T3 V1.6.1.
 // Reset pin handled manually in oledInit() to avoid a hang in the static
@@ -135,6 +150,13 @@ static U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, OLED_SCL
 #define OLED_I2C_ADDR 0x3C
 #endif
 static bool oledPresent = false;
+static float oledVbat = NAN;
+#ifdef FLOWERCARE_MAC
+static float   oledSoilTempC = NAN;
+static int     oledSoilMoist = -1;
+static int32_t oledSoilLight = -1;
+static int     oledSoilCond  = -1;
+#endif
 #endif
 
 // RTC memory survives deep sleep, resets on full power cycle. The reset is
@@ -231,13 +253,15 @@ static void oledInit() {
 
 static void oledRender(float currentDist, float currentTemp, uint32_t txSeq) {
   if (!oledPresent) return;
+  uint32_t now = millis();
+  bool blink = (now / 500) % 2;
 
   bool fresh = !isnan(currentDist);
   bool stale = false;
   float shown = currentDist;
   if (!fresh) {
     if (!isnan(lastValidDistanceCm) &&
-        (millis() - lastValidDistanceMs) < US_STALE_MS) {
+        (now - lastValidDistanceMs) < US_STALE_MS) {
       shown = lastValidDistanceCm;
       stale = true;
     }
@@ -245,34 +269,131 @@ static void oledRender(float currentDist, float currentTemp, uint32_t txSeq) {
 
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x10_tf);
-  oled.drawStr(0, 9, "Cuve emitter");
-  oled.drawStr(74, 9, loraReady ? "LoRa OK" : "LoRa ERR");
-  oled.drawHLine(0, 12, 128);
+
+#ifdef FLOWERCARE_MAC
+  // Compact 5-row layout (128x64):
+  //   y=9:  CUVE          <interval>
+  //   y=34: <24pt dist>          cm
+  //   y=46: W:<water>C  <vbat>V
+  //   y=56: T:<soil>    H:<moist>%
+  //   y=63: L:<lux>     C:<cond>
+  oled.drawStr(0, 9, "CUVE");
+  if (!loraReady && blink) {
+    oled.setFont(u8g2_font_open_iconic_all_1x_t);
+    oled.drawGlyph(30, 9, 0x118);
+    oled.setFont(u8g2_font_6x10_tf);
+  }
+  {
+    char ibuf[8];
+    snprintf(ibuf, sizeof(ibuf), "%us", static_cast<unsigned>(txIntervalS));
+    oled.drawStr(128 - static_cast<uint8_t>(strlen(ibuf) * 6), 9, ibuf);
+  }
+
+  oled.setFont(u8g2_font_logisoso16_tn);
+  if (isnan(shown)) {
+    oled.drawStr(8, 26, "----");
+  } else if (!stale || blink) {
+    char num[12];
+    snprintf(num, sizeof(num), "%.1f", shown);
+    oled.drawStr(8, 26, num);
+  }
+  oled.setFont(u8g2_font_6x10_tf);
+  if (!isnan(shown) && (!stale || blink)) {
+    oled.drawStr(72, 26, "cm");
+  }
+
+  // Water temp + vbat
+  if (!isnan(currentTemp)) {
+    char buf[12];
+    snprintf(buf, sizeof(buf), "W:%.1f\xb0""C", currentTemp);
+    oled.drawStr(0, 40, buf);
+  } else {
+    oled.drawStr(0, 40, "W:---");
+  }
+  if (!isnan(oledVbat)) {
+    bool vbatLow = oledVbat < 3.5f;
+    if (!vbatLow || blink) {
+      char buf[8];
+      snprintf(buf, sizeof(buf), "%.2fV", oledVbat);
+      oled.drawStr(66, 40, buf);
+    }
+  }
+
+  // Soil temp + moisture
+  if (!isnan(oledSoilTempC)) {
+    char buf[10];
+    snprintf(buf, sizeof(buf), "T:%.1f", oledSoilTempC);
+    oled.drawStr(0, 52, buf);
+  } else {
+    oled.drawStr(0, 52, "T:---");
+  }
+  if (oledSoilMoist >= 0) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "H:%d%%", oledSoilMoist);
+    oled.drawStr(66, 52, buf);
+  } else {
+    oled.drawStr(66, 52, "H:--");
+  }
+
+  // Soil light + conductivity
+  if (oledSoilLight >= 0) {
+    char buf[12];
+    snprintf(buf, sizeof(buf), "L:%ld", (long)oledSoilLight);
+    oled.drawStr(0, 63, buf);
+  } else {
+    oled.drawStr(0, 63, "L:---");
+  }
+  if (oledSoilCond >= 0) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "C:%d", oledSoilCond);
+    oled.drawStr(66, 63, buf);
+  } else {
+    oled.drawStr(66, 63, "C:--");
+  }
+
+#else
+  // Standard layout: header y=10, big number y=44, footer y=62
+  oled.drawStr(0, 10, "CUVE");
+  if (!loraReady && blink) {
+    oled.setFont(u8g2_font_open_iconic_all_1x_t);
+    oled.drawGlyph(114, 10, 0x118);
+    oled.setFont(u8g2_font_6x10_tf);
+  }
 
   oled.setFont(u8g2_font_logisoso24_tn);
-  char num[12];
   if (isnan(shown)) {
     oled.drawStr(8, 44, "----");
-  } else {
+  } else if (!stale || blink) {
+    char num[12];
     snprintf(num, sizeof(num), "%.1f", shown);
     oled.drawStr(8, 44, num);
   }
   oled.setFont(u8g2_font_6x10_tf);
-  oled.drawStr(102, 44, "cm");
-  if (stale) oled.drawStr(118, 9, "?");
-
-  oled.drawHLine(0, 50, 128);
-  char foot[40];
-  if (isnan(currentTemp)) {
-    snprintf(foot, sizeof(foot), "TX #%lu  %us",
-             static_cast<unsigned long>(txSeq),
-             static_cast<unsigned>(txIntervalS));
-  } else {
-    snprintf(foot, sizeof(foot), "TX #%lu %.1fC %us",
-             static_cast<unsigned long>(txSeq), currentTemp,
-             static_cast<unsigned>(txIntervalS));
+  if (!isnan(shown) && (!stale || blink)) {
+    oled.drawStr(102, 44, "cm");
   }
-  oled.drawStr(0, 62, foot);
+
+  if (!isnan(currentTemp)) {
+    char buf[10];
+    snprintf(buf, sizeof(buf), "%.1f\xb0""C", currentTemp);
+    oled.drawStr(0, 62, buf);
+  } else {
+    oled.drawStr(0, 62, "---");
+  }
+  if (!isnan(oledVbat)) {
+    bool vbatLow = oledVbat < 3.5f;
+    if (!vbatLow || blink) {
+      char buf[8];
+      snprintf(buf, sizeof(buf), "%.2fV", oledVbat);
+      oled.drawStr(44, 62, buf);
+    }
+  }
+  {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%us", static_cast<unsigned>(txIntervalS));
+    oled.drawStr(128 - static_cast<uint8_t>(strlen(buf) * 6), 62, buf);
+  }
+#endif
 
   oled.sendBuffer();
 }
@@ -396,6 +517,70 @@ static bool tryReceiveConfig(uint32_t reqSeq) {
   return false;
 }
 
+#ifdef FLOWERCARE_MAC
+struct FlowerCareData {
+  float    soilTempC;
+  uint8_t  soilMoisture;
+  uint32_t lightLux;
+  int16_t  conductivity;
+  uint8_t  battery;
+  bool     valid;
+};
+
+static FlowerCareData readFlowerCare() {
+  FlowerCareData out = {NAN, 0, 0, 0, 0, false};
+  NimBLEClient* client = NimBLEDevice::createClient();
+  if (!client) {
+    Serial.println("[emitter] FlowerCare: createClient failed");
+    return out;
+  }
+  client->setConnectTimeout(FLOWERCARE_CONNECT_TIMEOUT_S);
+  if (!client->connect(NimBLEAddress(FLOWERCARE_MAC, 0))) {
+    Serial.println("[emitter] FlowerCare: connect failed");
+    NimBLEDevice::deleteClient(client);
+    return out;
+  }
+  do {
+    NimBLERemoteService* svc = client->getService("00001204-0000-1000-8000-00805f9b34fb");
+    if (!svc) { Serial.println("[emitter] FlowerCare: service not found"); break; }
+    NimBLERemoteCharacteristic* cmd  = svc->getCharacteristic("00001a00-0000-1000-8000-00805f9b34fb");
+    NimBLERemoteCharacteristic* data = svc->getCharacteristic("00001a01-0000-1000-8000-00805f9b34fb");
+    NimBLERemoteCharacteristic* batC = svc->getCharacteristic("00001a02-0000-1000-8000-00805f9b34fb");
+    if (!cmd || !data) { Serial.println("[emitter] FlowerCare: char not found"); break; }
+    uint8_t wake[] = {0xA0, 0x1F};
+    if (!cmd->writeValue(wake, sizeof(wake), true)) {
+      Serial.println("[emitter] FlowerCare: write failed");
+      break;
+    }
+    delay(300);
+    std::string raw = data->readValue();
+    if (raw.length() < 10) {
+      Serial.printf("[emitter] FlowerCare: short read %u bytes\n", (unsigned)raw.length());
+      client->disconnect();
+      break;
+    }
+    const uint8_t* d = reinterpret_cast<const uint8_t*>(raw.data());
+    int16_t rawT;
+    memcpy(&rawT, d, 2);     out.soilTempC    = rawT / 10.0f;
+    memcpy(&out.lightLux, d + 3, 4);
+                              out.soilMoisture = d[7];
+    memcpy(&out.conductivity, d + 8, 2);
+    if (batC) {
+      std::string b = batC->readValue();
+      if (!b.empty()) out.battery = (uint8_t)b[0];
+    }
+    out.valid = true;
+    Serial.printf("[emitter] FlowerCare T:%.1f H:%u L:%lu C:%d BAT:%u\n",
+      out.soilTempC, (unsigned)out.soilMoisture, (unsigned long)out.lightLux,
+      (int)out.conductivity, (unsigned)out.battery);
+  } while (false);
+
+  client->disconnect();
+  NimBLEDevice::deleteClient(client);
+  return out;
+}
+#endif // FLOWERCARE_MAC
+
 static void sendSample() {
   float dist = readDistanceCm();
   if (!isnan(dist)) {
@@ -403,6 +588,9 @@ static void sendSample() {
     lastValidDistanceMs = millis();
   }
   float waterTemp = readWaterTempC();
+#ifdef FLOWERCARE_MAC
+  FlowerCareData fc = readFlowerCare();
+#endif
   float vbat = readVbatVolts();
   uint32_t s = rtcSeq++;
   // Always request config for the first 5 packets (covers missed ACK on boot 0).
@@ -424,9 +612,24 @@ static void sendSample() {
     doc["water_temp_c"] = roundf(waterTemp * 10.0f) / 10.0f;
   }
   doc["vbat"] = roundf(vbat * 100.0f) / 100.0f;
+#ifdef FLOWERCARE_MAC
+  if (fc.valid) {
+    doc["soil_temp_c"]   = roundf(fc.soilTempC * 10.0f) / 10.0f;
+    doc["soil_moisture"] = fc.soilMoisture;
+    doc["soil_light"]    = fc.lightLux;
+    doc["soil_cond"]     = fc.conductivity;
+    doc["soil_bat"]      = fc.battery;
+  } else {
+    doc["soil_temp_c"]   = nullptr;
+    doc["soil_moisture"] = nullptr;
+    doc["soil_light"]    = nullptr;
+    doc["soil_cond"]     = nullptr;
+    doc["soil_bat"]      = nullptr;
+  }
+#endif
   if (wantCfg) doc["cfg_req"] = 1;
 
-  char buf[200];
+  char buf[256];
   size_t n = serializeJson(doc, buf, sizeof(buf));
   n = authAppendMac(buf, n, sizeof(buf),
                     reinterpret_cast<const uint8_t*>(LORA_PSK),
@@ -456,6 +659,13 @@ static void sendSample() {
   }
 
 #if WITH_OLED
+  oledVbat = vbat;
+#ifdef FLOWERCARE_MAC
+  oledSoilTempC = fc.valid ? fc.soilTempC        : NAN;
+  oledSoilMoist = fc.valid ? (int)fc.soilMoisture : -1;
+  oledSoilLight = fc.valid ? (int32_t)fc.lightLux : -1;
+  oledSoilCond  = fc.valid ? (int)fc.conductivity  : -1;
+#endif
   oledRender(dist, waterTemp, s);
 #endif
 }
@@ -474,6 +684,9 @@ static void enterDeepSleep() {
   // Park the SX1276 in STDBY before yanking power: empties FIFOs and avoids
   // a half-finished TX leaking into the next boot's first packet.
   if (loraReady) loraRadio.sleep();
+#ifdef FLOWERCARE_MAC
+  NimBLEDevice::deinit(true);
+#endif
   esp_sleep_enable_timer_wakeup(us);
   esp_deep_sleep_start();
 }
@@ -497,6 +710,9 @@ void setup() {
 #endif
   sensorInit();
   tempInit();
+#ifdef FLOWERCARE_MAC
+  NimBLEDevice::init("");
+#endif
   loraInit();
 #if WITH_OLED
   oledRender(NAN, NAN, rtcSeq);

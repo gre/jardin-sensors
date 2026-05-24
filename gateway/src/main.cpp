@@ -55,6 +55,9 @@
 // Emitter model (the HA device), not the gateway.
 #define HA_DEVICE_MODEL "TTGO LoRa32"
 #endif
+#ifndef HA_FLOWERCARE_DEVICE_NAME
+#define HA_FLOWERCARE_DEVICE_NAME "Flower Care"
+#endif
 #ifndef HA_DEVICE_MANUFACTURER
 #define HA_DEVICE_MANUFACTURER "DIY"
 #endif
@@ -208,7 +211,8 @@ static PubSubClient mqtt(wifiClient);
 #if WITH_OLED
 // Constructor with no reset pin (touching GPIO 16 on this T3 V1.6.1 variant
 // causes a chip reset). The hardware RC at power-on is enough.
-static U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
+// R1 = 90° CW → portrait 64×128.
+static U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R1, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
 #ifndef OLED_I2C_ADDR
 #define OLED_I2C_ADDR 0x3C
 #endif
@@ -217,14 +221,19 @@ static U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, OLED_SCL
 #endif
 static bool oledPresent = false;
 
-// Snapshot of the last received packet, to refresh the OLED.
+// Snapshot of the last received cuve packet, to refresh the OLED.
 static String lastNodeName;
-static int lastTankPct = -1;
-static float lastTankCm = NAN;
-static float lastWaterTempC = NAN;
-static int lastRssi = 0;
-static float lastSnr = 0.0f;
-static uint32_t lastRxMs = 0;
+static int     lastTankPct    = -1;
+static float   lastTankCm     = NAN;
+static float   lastWaterTempC = NAN;
+static float   lastVbat       = NAN;
+static float   lastSoilTempC  = NAN;
+static uint8_t lastSoilMoisture = 0;
+static uint32_t lastSoilLux   = 0;
+static int16_t lastSoilCond   = 0;
+static int     lastRssi       = 0;
+static float   lastSnr        = 0.0f;
+static uint32_t lastRxMs      = 0;
 #endif
 
 struct HaSensor {
@@ -400,6 +409,62 @@ static void sendRelayCommand(const char* node, int relay1, int relay2) {
   p.begin("gw-sec", false);
   p.putUInt("cs", g_cmdSeq);
   p.end();
+}
+
+static const HaSensor HA_FC_SENSORS[] = {
+  {"soil_temp_c",   "Soil temperature",  "temperature", "°C",    "measurement", nullptr},
+  {"soil_moisture", "Soil moisture",     "moisture",    "%",     "measurement", nullptr},
+  {"soil_light",    "Soil light",        "illuminance", "lx",    "measurement", nullptr},
+  {"soil_cond",     "Soil conductivity", nullptr,       "µS/cm", "measurement", "diagnostic"},
+  {"soil_bat",      "Battery",           "battery",     "%",     "measurement", "diagnostic"},
+};
+constexpr size_t HA_FC_SENSORS_N = sizeof(HA_FC_SENSORS) / sizeof(HA_FC_SENSORS[0]);
+
+// Publish HA discovery for the Flower Care as its own device, reading from
+// the cuve state topic (data is piggybacked on the cuve-emitter LoRa packet).
+static bool publishFlowercareDiscovery(const char* stateNode) {
+  char stateTopic[96];  buildStateTopic(stateNode, stateTopic, sizeof(stateTopic));
+  char availTopic[96];  buildAvailabilityTopic(stateNode, availTopic, sizeof(availTopic));
+  char deviceId[64];    snprintf(deviceId, sizeof(deviceId), "%s-flowercare", MQTT_BASE_TOPIC);
+
+  bool allOk = true;
+  for (size_t i = 0; i < HA_FC_SENSORS_N; ++i) {
+    const HaSensor& s = HA_FC_SENSORS[i];
+    JsonDocument doc;
+    doc["name"] = s.name;
+    char unique[80];
+    snprintf(unique, sizeof(unique), "%s-%s", deviceId, s.key);
+    doc["unique_id"]   = unique;
+    doc["state_topic"] = stateTopic;
+    char valueTpl[48];
+    snprintf(valueTpl, sizeof(valueTpl), "{{ value_json.%s }}", s.key);
+    doc["value_template"] = valueTpl;
+    if (s.deviceClass)    doc["device_class"]        = s.deviceClass;
+    if (s.unit)           doc["unit_of_measurement"] = s.unit;
+    if (s.stateClass)     doc["state_class"]         = s.stateClass;
+    if (s.entityCategory) doc["entity_category"]     = s.entityCategory;
+    doc["availability_topic"]    = availTopic;
+    doc["payload_available"]     = "online";
+    doc["payload_not_available"] = "offline";
+    doc["expire_after"] = (NODE_TIMEOUT_MS / 1000UL) + 30UL;
+
+    JsonObject device = doc["device"].to<JsonObject>();
+    device["identifiers"].add(deviceId);
+    device["name"]         = HA_FLOWERCARE_DEVICE_NAME;
+    device["model"]        = "HHCC JCY01HHCC";
+    device["manufacturer"] = "HHCC Plant Technology Co. Ltd";
+
+    char topic[160];
+    snprintf(topic, sizeof(topic), "%s/sensor/%s/%s/config",
+             HA_DISCOVERY_PREFIX, deviceId, s.key);
+    char buf[512];
+    size_t n = serializeJson(doc, buf, sizeof(buf));
+    bool ok = mqtt.publish(topic, reinterpret_cast<const uint8_t*>(buf), n, true);
+    if (!ok) allOk = false;
+    Serial.printf("[gateway] HA flowercare %s len=%u ok=%d\n",
+                  topic, static_cast<unsigned>(n), ok);
+  }
+  return allOk;
 }
 
 static bool publishSensorDiscoveries(const char* node, const char* deviceName,
@@ -689,76 +754,150 @@ static void oledInit() {
   Serial.println("[gateway] OLED ready");
 }
 
+// Portrait 64×128. x=0..63, y=0..127.
+// Draws a filled progress bar: outer frame + inner fill proportional to pct (0-100).
+static void oledBar(uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint8_t pct) {
+  oled.drawFrame(x, y, w, h);
+  uint8_t fill = (uint8_t)((uint16_t)pct * (w - 2) / 100);
+  if (fill > 0) oled.drawBox(x + 1, y + 1, fill, h - 2);
+}
+
+// Draws text inverted (white box behind, black foreground). w = box width in px.
+static void oledInvert(uint8_t x, uint8_t y, uint8_t w, const char* str) {
+  oled.drawBox(x, y - 8, w, 10);
+  oled.setDrawColor(0);
+  oled.drawStr(x, y, str);
+  oled.setDrawColor(1);
+}
+
 static void oledRender() {
   if (!oledPresent) return;
   uint32_t now = millis();
   bool wifiUp = (WiFi.status() == WL_CONNECTED);
   bool mqttUp = mqtt.connected();
+  bool blink  = (now / 500) % 2;  // 1 Hz toggle, matches OLED_REFRESH_MS
+  uint32_t ageSec  = lastRxMs ? (now - lastRxMs) / 1000 : 0;
+  bool cuveStale   = lastRxMs && (ageSec > (uint32_t)g_cuveTxIntervalS * 2);
 
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x10_tf);
 
-  // Header: Gateway + WiFi/MQTT status
-  oled.drawStr(0, 9, "Gateway");
-  char hdr[16];
-  snprintf(hdr, sizeof(hdr), "W:%s M:%s",
-           wifiUp ? "OK" : "--",
-           mqttUp ? "OK" : "--");
-  oled.drawStr(60, 9, hdr);
-  oled.drawHLine(0, 12, 128);
-
-  // Big tank percentage (or "----" if no data)
-  oled.setFont(u8g2_font_logisoso24_tn);
-  char num[12];
-  if (lastTankPct < 0) {
-    oled.drawStr(8, 44, "----");
-  } else {
-    snprintf(num, sizeof(num), "%d", lastTankPct);
-    oled.drawStr(8, 44, num);
+  // --- Header ---
+  oled.drawStr(0, 10, "JARDIN");
+  oled.setFont(u8g2_font_open_iconic_all_1x_t);
+  // Home icon (0xB8 = "B8" in browser): HA/MQTT connection.
+  if (mqttUp) {
+    oled.drawGlyph(40, 10, 0xB8);
+  } else if (blink) {
+    oled.drawGlyph(40, 10, 0x118);  // warning ("18") when MQTT down
+  }
+  // Cuve icon (0x119 = "19" in browser): data received from cuve node.
+  bool cuveHeard = lastRxMs > 0;
+  if (cuveHeard && !cuveStale) {
+    oled.drawGlyph(52, 10, 0x119);
+  } else if (cuveHeard && cuveStale && blink) {
+    oled.drawGlyph(52, 10, 0x119);  // blink = stale
   }
   oled.setFont(u8g2_font_6x10_tf);
-  if (lastTankPct >= 0) oled.drawStr(65, 44, "%");
 
-  // Right column: show desired state immediately; append '*' while command is in-flight.
-  char rc[8];
+  // --- Cuve ---
+  if (!cuveStale || blink) {
+    char buf[12];
+    if (lastTankPct >= 0) snprintf(buf, sizeof(buf), "Cuve  %d%%", lastTankPct);
+    else                  snprintf(buf, sizeof(buf), "Cuve  ---");
+    oled.drawStr(0, 28, buf);
+  }
   if (!isnan(lastWaterTempC)) {
-    snprintf(rc, sizeof(rc), "%.1fC", lastWaterTempC);
-    oled.drawStr(76, 22, rc);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "Eau %.1f\xb0""C", lastWaterTempC);
+    oled.drawStr(0, 40, buf);
   }
-  int oR1 = (g_relay1Desired >= 0) ? g_relay1Desired : g_relay1Actual;
-  int oR2 = (g_relay2Desired >= 0) ? g_relay2Desired : g_relay2Actual;
-  snprintf(rc, sizeof(rc), "P1:%s%s",
-           oR1 < 0 ? "--" : (oR1 ? "ON" : "OF"),
-           g_relay1Desired >= 0 ? "*" : "");
-  oled.drawStr(76, 34, rc);
-  snprintf(rc, sizeof(rc), "P2:%s%s",
-           oR2 < 0 ? "--" : (oR2 ? "ON" : "OF"),
-           g_relay2Desired >= 0 ? "*" : "");
-  oled.drawStr(76, 46, rc);
 
-  // Footer: node name + age + RSSI
-  oled.drawHLine(0, 50, 128);
-  char foot[32];
-  if (lastRxMs == 0) {
-    snprintf(foot, sizeof(foot), "no RX yet");
+  // --- Prises: P1 / P2 with inverted "ON", blink if actuator offline ---
+  NodeState* act = findNode(ACTUATOR_NODE_ID);
+  bool prisesOnline = act && act->online;
+  if (!prisesOnline) {
+    if (blink) {
+      oled.setFont(u8g2_font_open_iconic_all_1x_t);
+      oled.drawGlyph(0, 56, 0x57);   // ban = disabled ("57" in browser)
+      oled.setFont(u8g2_font_6x10_tf);
+      oled.drawStr(12, 56, "prises");
+    }
   } else {
-    uint32_t ageS = (now - lastRxMs) / 1000;
-    snprintf(foot, sizeof(foot), "%s %lus %ddBm",
-             lastNodeName.length() ? lastNodeName.c_str() : "?",
-             static_cast<unsigned long>(ageS),
-             lastRssi);
+    int r1 = g_relay1Desired >= 0 ? g_relay1Desired : g_relay1Actual;
+    int r2 = g_relay2Desired >= 0 ? g_relay2Desired : g_relay2Actual;
+    // P1 (left half): label inverted when ON, state text beside it
+    if (r1 > 0) { oledInvert(0, 56, 14, "P1"); } else { oled.drawStr(0, 56, "P1"); }
+    oled.drawStr(16, 56, r1 > 0 ? "ON" : (r1 < 0 ? "--" : "OF"));
+    // P2 (right half, x=32)
+    if (r2 > 0) { oledInvert(32, 56, 14, "P2"); } else { oled.drawStr(32, 56, "P2"); }
+    oled.drawStr(48, 56, r2 > 0 ? "ON" : (r2 < 0 ? "--" : "OF"));
   }
-  oled.drawStr(0, 62, foot);
+
+  // --- Sol (Flower Care) ---
+  if (!isnan(lastSoilTempC)) {
+    char buf[20];
+    snprintf(buf, sizeof(buf), "Sol %.1f\xb0""C", lastSoilTempC);
+    oled.drawStr(0, 72, buf);
+    snprintf(buf, sizeof(buf), "Hum %u%%", (unsigned)lastSoilMoisture);
+    oled.drawStr(0, 84, buf);
+
+    // Lux: sun icon + value
+    oled.setFont(u8g2_font_open_iconic_all_1x_t);
+    oled.drawGlyph(0, 96, 0x101);  // sun
+    oled.setFont(u8g2_font_6x10_tf);
+    {
+      char buf[16];
+      if (lastSoilLux >= 1000) snprintf(buf, sizeof(buf), "%.1fklx", lastSoilLux / 1000.0f);
+      else                     snprintf(buf, sizeof(buf), "%lulx", (unsigned long)lastSoilLux);
+      oled.drawStr(10, 96, buf);
+    }
+
+    // Conductivity: droplet icon + value
+    oled.setFont(u8g2_font_open_iconic_all_1x_t);
+    oled.drawGlyph(0, 108, 0x97);  // droplet
+    oled.setFont(u8g2_font_6x10_tf);
+    {
+      char buf[12];
+      snprintf(buf, sizeof(buf), "%duS/cm", (int)lastSoilCond);
+      oled.drawStr(10, 108, buf);
+    }
+  } else {
+    oled.drawStr(0, 72, "Sol: ---");
+  }
+
+  // --- Footer: age (blinks if stale) + vbat (blinks if low) ---
+  if (lastRxMs == 0) {
+    if (blink) oled.drawStr(0, 124, "Connexion");
+  } else if (!cuveStale || blink) {
+    char buf[10];
+    if (ageSec < 3600) snprintf(buf, sizeof(buf), "%lus", (unsigned long)ageSec);
+    else               snprintf(buf, sizeof(buf), "%lum", (unsigned long)(ageSec / 60));
+    oled.drawStr(0, 124, buf);
+  }
+  if (!isnan(lastVbat)) {
+    bool vbatLow = lastVbat < 4.0f;
+    if (!vbatLow || blink) {
+      char buf[8];
+      snprintf(buf, sizeof(buf), "%.2fV", lastVbat);
+      oled.drawStr(32, 124, buf);
+    }
+  }
 
   oled.sendBuffer();
 }
 
 static void oledRecordRx(const JsonDocument& doc, int rssi, float snr) {
   const char* node = doc["node"] | "";
-  lastNodeName = node;
-  lastTankCm     = doc["tank_cm"].isNull()      ? NAN : doc["tank_cm"].as<float>();
-  lastWaterTempC = doc["water_temp_c"].isNull() ? NAN : doc["water_temp_c"].as<float>();
-  lastTankPct    = doc["tank_pct"].isNull()     ? -1  : doc["tank_pct"].as<int>();
+  lastNodeName    = node;
+  lastTankCm      = doc["tank_cm"].isNull()       ? NAN : doc["tank_cm"].as<float>();
+  lastWaterTempC  = doc["water_temp_c"].isNull()  ? NAN : doc["water_temp_c"].as<float>();
+  lastTankPct     = doc["tank_pct"].isNull()      ? -1  : doc["tank_pct"].as<int>();
+  lastVbat        = doc["vbat"].isNull()           ? NAN : doc["vbat"].as<float>();
+  lastSoilTempC   = doc["soil_temp_c"].isNull()   ? NAN : doc["soil_temp_c"].as<float>();
+  lastSoilMoisture = doc["soil_moisture"].isNull() ? 0  : doc["soil_moisture"].as<uint8_t>();
+  lastSoilLux     = doc["soil_light"].isNull()    ? 0   : doc["soil_light"].as<uint32_t>();
+  lastSoilCond    = doc["soil_cond"].isNull()     ? 0   : doc["soil_cond"].as<int16_t>();
   lastRssi = rssi;
   lastSnr  = snr;
   lastRxMs = millis();
@@ -857,6 +996,7 @@ static void loadPowerOnBehavior() {
 
 static bool publishDiscovery(const char* node) {
   bool ok = publishSensorDiscoveries(node, HA_DEVICE_NAME, HA_SENSORS, HA_SENSORS_N);
+  ok &= publishFlowercareDiscovery(node);
 
   char stateTopic[96];  buildStateTopic(node, stateTopic, sizeof(stateTopic));
   char availTopic[96];  buildAvailabilityTopic(node, availTopic, sizeof(availTopic));
@@ -1116,7 +1256,7 @@ static void publishMeasurement(const char* json, size_t jsonLen, int rssi, float
   char topic[96];
   buildStateTopic(node, topic, sizeof(topic));
 
-  char buf[256];
+  char buf[384];
   size_t n = serializeJson(doc, buf, sizeof(buf));
   // retain=true: HA receives the last known value on (re)connection.
   bool ok = mqtt.publish(topic, reinterpret_cast<const uint8_t*>(buf), n, true);
@@ -1204,7 +1344,7 @@ void loop() {
     loraRxFlag = false;
     int rssi = static_cast<int>(loraRadio.getRSSI());
     float snr = loraRadio.getSNR();
-    char rxBuf[200];
+    char rxBuf[256];
     size_t pktLen = loraReadPacket(rxBuf, sizeof(rxBuf));
     if (pktLen > 0) {
       int jsonLen = authVerifyMac(rxBuf, static_cast<int>(pktLen),

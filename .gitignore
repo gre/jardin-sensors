@@ -1,4 +1,5 @@
 secrets.ini
+logs.txt
 .pio/
 .pioenvs/
 .piolibdeps/
