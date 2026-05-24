@@ -842,25 +842,16 @@ static void oledRender() {
     snprintf(buf, sizeof(buf), "Hum %u%%", (unsigned)lastSoilMoisture);
     oled.drawStr(0, 84, buf);
 
-    // Lux: sun icon + value
-    oled.setFont(u8g2_font_open_iconic_all_1x_t);
-    oled.drawGlyph(0, 96, 0x101);  // sun
-    oled.setFont(u8g2_font_6x10_tf);
     {
       char buf[16];
-      if (lastSoilLux >= 1000) snprintf(buf, sizeof(buf), "%.1fklx", lastSoilLux / 1000.0f);
-      else                     snprintf(buf, sizeof(buf), "%lulx", (unsigned long)lastSoilLux);
-      oled.drawStr(10, 96, buf);
+      if (lastSoilLux >= 1000) snprintf(buf, sizeof(buf), "%.1f klx", lastSoilLux / 1000.0f);
+      else                     snprintf(buf, sizeof(buf), "%lu lux", (unsigned long)lastSoilLux);
+      oled.drawStr(0, 96, buf);
     }
-
-    // Conductivity: droplet icon + value
-    oled.setFont(u8g2_font_open_iconic_all_1x_t);
-    oled.drawGlyph(0, 108, 0x97);  // droplet
-    oled.setFont(u8g2_font_6x10_tf);
     {
-      char buf[12];
-      snprintf(buf, sizeof(buf), "%duS/cm", (int)lastSoilCond);
-      oled.drawStr(10, 108, buf);
+      char buf[14];
+      snprintf(buf, sizeof(buf), "%d uS/cm", (int)lastSoilCond);
+      oled.drawStr(0, 108, buf);
     }
   } else {
     oled.drawStr(0, 72, "Sol: ---");
