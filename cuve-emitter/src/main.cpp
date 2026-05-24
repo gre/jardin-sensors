@@ -16,8 +16,12 @@
 extern "C" bool btInUse() { return true; }
 #endif
 
-#ifndef LORA_PSK
-#error "LORA_PSK undefined: cp secrets.example.ini secrets.ini then fill in."
+#ifndef DEBUG_US
+#  ifndef LORA_PSK
+#    error "LORA_PSK undefined: cp secrets.example.ini secrets.ini then fill in."
+#  endif
+#else
+#  define LORA_PSK ""
 #endif
 
 #if WITH_OLED
@@ -103,9 +107,9 @@ extern "C" bool btInUse() { return true; }
 #define OLED_DISPLAY_MS_MAX 30000
 #endif
 
-// SR04M-2 in mode 0 (TTL pulse): RX=TRIG (sensor input), TX=ECHO (output).
-// Datasheet: VCC 3.0-5.5V. Powered at 3.3V => echo at 3.3V => safe for ESP32.
-// Wiring: sensor RX -> ESP32 IO4 (trig out), sensor TX -> ESP32 IO25 (echo in).
+// HC-SR04 waterproof variant. VCC=5V; ECHO outputs 5V => voltage divider
+// 10k+20k required on ECHO before ESP32 GPIO (brings 5V down to ~3.3V).
+// Wiring: TRIG -> ESP32 IO4, ECHO -> divider -> ESP32 IO25.
 #ifndef US_TRIG_PIN
 #define US_TRIG_PIN 4
 #endif
@@ -115,8 +119,7 @@ extern "C" bool btInUse() { return true; }
 #ifndef US_TIMEOUT_US
 #define US_TIMEOUT_US 40000UL
 #endif
-// 100us: comfortable margin vs datasheet spec ">10uS". Helps reliability when
-// the TRIG pulse is driven at 3.3V (ESP32) on a sensor with VCC=5V.
+// 100us: comfortable margin vs datasheet minimum of 10us.
 #ifndef US_TRIG_PULSE_US
 #define US_TRIG_PULSE_US 100
 #endif
@@ -709,6 +712,20 @@ void setup() {
   oledInit();
 #endif
   sensorInit();
+
+#ifdef DEBUG_US
+  Serial.println("[debug] US continuous mode — reading every 100ms");
+  while (true) {
+    float d = readDistanceCm();
+    if (isnan(d)) Serial.println("[US] ---");
+    else          Serial.printf("[US] %.1f cm\n", d);
+#if WITH_OLED
+    oledRender(d, NAN, 0);
+#endif
+    delay(100);
+  }
+#endif
+
   tempInit();
 #ifdef FLOWERCARE_MAC
   NimBLEDevice::init("");

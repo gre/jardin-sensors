@@ -11,8 +11,8 @@ Connected garden, LoRa point-to-point + Home Assistant via MQTT.
   (emitter), one in the house (gateway). No hardware difference between the
   two roles.
 - **Sensors on emitter side**:
-  - SR04M-2 (JSN-SR04T family): mode 0 by default, RX/TX = TRIG/ECHO. Echo
-    is 5V => voltage divider 10k+20k to ESP32. 22 uF cap on VCC mandatory.
+  - HC-SR04 waterproof variant. TRIG -> GPIO4, ECHO -> 10k+20k divider -> GPIO25
+    (ECHO is 5V, divider mandatory). VCC 5V.
   - DS18B20 stainless steel waterproof probe 5m, 1-Wire, factory-calibrated.
     4.7k pull-up required between DATA and VDD.
 - **LILYGO T3 V1.6.1 OLED quirk**: do not software-pulse GPIO 16 (OLED_RST).
