@@ -11,9 +11,6 @@
 
 #ifdef WITH_FLOWERCARE
 #include <NimBLEDevice.h>
-// Arduino 3.x releases BTDM memory in initArduino() unless btInUse() returns
-// true. NimBLE-Arduino 1.4.x doesn't set _btLibraryInUse, so override here.
-extern "C" bool btInUse() { return true; }
 // Hard limit from LoRa packet budget: 3 sensors fill ~225 bytes at most.
 #define FC_MAX_SENSORS 3
 #endif
