@@ -10,6 +10,7 @@ Monitoring, alerting, and remote control for the garden:
 - tank level reported via ultrasonic sensor
 - "needs refill" notification
 - **remote outlet control** (relay actuator) — switch garden sockets from HA
+- **plant monitoring** via Flower Care BLE sensors (soil temp, moisture, light, conductivity)
 - centralized integration into **Home Assistant**
 
 ## Constraints
@@ -176,11 +177,29 @@ current state.
 | `seq` | emitter | int | – | – | packet counter |
 | `tank_cm` | emitter | float | cm | diagnostic | raw ultrasonic distance |
 | `water_temp_c` | emitter | float | °C | primary | water temperature (DS18B20, factory-calibrated) |
+| `fc` | emitter | array | – | – | Flower Care readings, one entry per MAC (see below) |
 | `rssi` | gateway | int | dBm | diagnostic | LoRa reception quality |
 | `snr` | gateway | float | dB | diagnostic | LoRa signal-to-noise ratio |
 | `tank_pct` | **gateway derived** | int | % | primary | tank fill level |
 
 > Note: `water_temp_c` is sent directly in °C by the emitter without gateway-side derivation. The DS18B20 is factory-calibrated to ±0.5 °C, no deployment-specific parameter. The "raw vs derived" rule applies to analog sensors or sensors that need deployment calibration (tank %).
+
+The `fc` array contains one entry per configured MAC in order; `null` if the BLE read failed for that slot:
+
+```json
+"fc": [
+  { "t": 22.5, "m": 45, "l": 1234, "c": 250, "b": 85 },
+  null
+]
+```
+
+| Key | Meaning | Unit |
+|---|---|---|
+| `t` | soil temperature | °C |
+| `m` | soil moisture | % |
+| `l` | light intensity | lux |
+| `c` | soil conductivity | µS/cm |
+| `b` | sensor battery | % |
 
 ## Tank geometry
 
@@ -303,7 +322,9 @@ flowchart LR
     JC --> JCE[tank_empty_cm]
     JC --> JCF[tank_full_cm]
     JC --> JCT[cuve_tx_interval_s]
+    JC --> JCFC[flowercare_sensors<br/><i>JSON array, retain</i>]
     J --> JR["prises/{relay}/set<br/><i>HA switch command, 0 or 1</i>"]
+    J --> JFC["flowercare/{mac}/state<br/><i>per-sensor JSON, retain</i>"]
 ```
 
 Example payload for `jardin/cuve/state` after augmentation by the gateway:
@@ -641,12 +662,80 @@ any new node.
   optimistic intermediate updates
 - **Diagnostic entities**: `vbat`, `rssi`, `snr`
 
+### Flower Care plant sensors
+
+Up to 3 HHCC JCY01HHCC sensors are supported. Each appears as a separate HA
+device ("Flower Care \<name\>") with 5 entities:
+
+| Entity | Unit | Key |
+|---|---|---|
+| Soil temperature | °C | `soil_temp_c` |
+| Soil moisture | % | `soil_moisture` |
+| Light intensity | lux | `soil_light` |
+| Soil conductivity | µS/cm | `soil_cond` |
+| Battery | % | `soil_bat` |
+
+State topic: `jardin/flowercare/<mac-lowercase-nocolon>/state` (retained).
+Availability tied to the cuve emitter (`jardin/cuve/availability`).
+
+#### Configuring sensors from HA
+
+Publish a retained JSON array to `jardin/config/flowercare_sensors`. The
+gateway stores it immediately and pushes the MAC list to the emitter on its
+next `cfg_req` round-trip.
+
+```bash
+mosquitto_pub -r -t jardin/config/flowercare_sensors \
+  -m '[{"mac":"AA:BB:CC:DD:EE:FF","name":"Tomate"},{"mac":"11:22:33:44:55:66","name":"Basilic"}]'
+```
+
+- MACs in uppercase colon-separated format (visible in nRF Connect or similar BLE scanner)
+- `name`: max 16 chars, displayed (truncated to 5-8 chars) on the gateway OLED
+- Max 3 sensors (LoRa packet budget)
+- Remove all sensors: publish `[]`
+
+To add sensors from the HA UI without a terminal, create a script in
+`configuration.yaml`:
+
+```yaml
+script:
+  set_flowercare_sensors:
+    alias: "Configurer capteurs Flower Care"
+    fields:
+      sensors_json:
+        description: 'Ex: [{"mac":"AA:BB:CC:DD:EE:FF","name":"Tomate"}]'
+        example: '[{"mac":"AA:BB:CC:DD:EE:FF","name":"Tomate"}]'
+    sequence:
+      - action: mqtt.publish
+        data:
+          topic: "jardin/config/flowercare_sensors"
+          payload: "{{ sensors_json }}"
+          retain: true
+```
+
+Then run it from **Developer Tools > Scripts > set_flowercare_sensors**.
+
+#### Deployment order (first setup)
+
+1. Flash the gateway
+2. Publish the MAC list via MQTT (above)
+3. Flash the emitter
+4. On first boot, the emitter sends `cfg_req=1` → gateway replies with MAC
+   list → emitter stores in NVS → starts polling
+
+The gateway OLED cycles through each sensor's readings every 5 s (shown as
+`<name> X/N` then temp/moisture/light/conductivity lines).
+
 ### Jardin Gateway device (config)
 
 - `Tank empty distance` (number, 0-200 cm)
 - `Tank full distance` (number, 0-200 cm)
 - `Cuve TX interval` (number, 5-3600 s) — pushed to the emitter on its next
   `cfg_req` round-trip, persisted in NVS
+- `Cuve boot delay` (number, ms) — delay between sensor power-on and first measurement
+- `Cuve OLED display` (number, ms) — how long the OLED stays on after a boot wake
+- `Cuve ultrasonic retries` (number) — ping retry count for tank distance
+- `Cuve temp retries` (number) — DS18B20 retry count
 
 ### Availability
 
@@ -751,6 +840,7 @@ LORA_PSK undefined`).
 - [x] **CSMA/CAD**: `loraTx()` wrapper in `lora_board.h` — pre-TX channel scan + random backoff before every transmit across all firmwares
 - [x] **Actuator restore on reboot**: `restore_req:1` in first heartbeat; gateway re-applies state per **Power-on behavior** select entity (`previous` / `on` / `off` / `toggle`)
 - [x] HA switch `device_class: outlet` for relay switch entities
+- [x] **Flower Care BLE** (HHCC JCY01HHCC): up to 3 sensors, MAC list configurable at runtime via MQTT/HA (no reflash), per-sensor HA device + 5 entities, gateway OLED cycling display, MAC list pushed to emitter via signed `cfg_req` LoRa reply
 
 ### Software (possibly later)
 - [ ] AES-128 on the LoRa payload for confidentiality (HMAC alone does not encrypt)

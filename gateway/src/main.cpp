@@ -58,6 +58,8 @@
 #ifndef HA_FLOWERCARE_DEVICE_NAME
 #define HA_FLOWERCARE_DEVICE_NAME "Flower Care"
 #endif
+// Hard limit matching the emitter's FC_MAX_SENSORS.
+#define FC_MAX_SENSORS 3
 #ifndef HA_DEVICE_MANUFACTURER
 #define HA_DEVICE_MANUFACTURER "DIY"
 #endif
@@ -205,6 +207,14 @@ static uint32_t g_relayTargetNvsDue = 0;  // millis() when to write target to NV
 static char g_powerOnBehavior[12] = "previous";  // "previous"|"on"|"off"|"toggle", NVS-persisted
 static uint8_t g_relayRetryCount = 0;
 
+struct FcSensor {
+  char mac[18];   // "AA:BB:CC:DD:EE:FF\0"
+  char name[17];  // up to 16 chars + null
+};
+
+static FcSensor g_fcSensors[FC_MAX_SENSORS];
+static uint8_t  g_fcSensorCount = 0;
+
 static WiFiClient wifiClient;
 static PubSubClient mqtt(wifiClient);
 
@@ -227,13 +237,21 @@ static int     lastTankPct    = -1;
 static float   lastTankCm     = NAN;
 static float   lastWaterTempC = NAN;
 static float   lastVbat       = NAN;
-static float   lastSoilTempC  = NAN;
-static uint8_t lastSoilMoisture = 0;
-static uint32_t lastSoilLux   = 0;
-static int16_t lastSoilCond   = 0;
 static int     lastRssi       = 0;
 static float   lastSnr        = 0.0f;
 static uint32_t lastRxMs      = 0;
+
+struct OledFcEntry {
+  float    soilTempC;
+  uint8_t  soilMoisture;
+  uint32_t soilLux;
+  int16_t  soilCond;
+  bool     valid;
+};
+static OledFcEntry lastFc[FC_MAX_SENSORS];
+static uint8_t     lastFcCount = 0;
+static uint8_t     g_fcPage    = 0;          // cycling display index
+static uint32_t    g_fcPageMs  = 0;          // millis() of last page change
 #endif
 
 struct HaSensor {
@@ -415,54 +433,93 @@ static const HaSensor HA_FC_SENSORS[] = {
   {"soil_temp_c",   "Soil temperature",  "temperature", "°C",    "measurement", nullptr},
   {"soil_moisture", "Soil moisture",     "moisture",    "%",     "measurement", nullptr},
   {"soil_light",    "Soil light",        "illuminance", "lx",    "measurement", nullptr},
-  {"soil_cond",     "Soil conductivity", nullptr,       "µS/cm", "measurement", "diagnostic"},
+  {"soil_cond",     "Soil conductivity", nullptr,       "µS/cm", "measurement", nullptr},
   {"soil_bat",      "Battery",           "battery",     "%",     "measurement", "diagnostic"},
 };
 constexpr size_t HA_FC_SENSORS_N = sizeof(HA_FC_SENSORS) / sizeof(HA_FC_SENSORS[0]);
 
-// Publish HA discovery for the Flower Care as its own device, reading from
-// the cuve state topic (data is piggybacked on the cuve-emitter LoRa packet).
-static bool publishFlowercareDiscovery(const char* stateNode) {
-  char stateTopic[96];  buildStateTopic(stateNode, stateTopic, sizeof(stateTopic));
-  char availTopic[96];  buildAvailabilityTopic(stateNode, availTopic, sizeof(availTopic));
-  char deviceId[64];    snprintf(deviceId, sizeof(deviceId), "%s-flowercare", MQTT_BASE_TOPIC);
+// Build the per-sensor MQTT state topic: jardin/flowercare/<mac-lower-nocolon>/state
+static void buildFcStateTopic(const char* mac, char* out, size_t outLen) {
+  char compact[13] = "";  // 12 hex chars + null
+  size_t ci = 0;
+  for (size_t i = 0; mac[i] && ci < 12; i++) {
+    if (mac[i] != ':') compact[ci++] = (char)tolower((unsigned char)mac[i]);
+  }
+  compact[ci] = '\0';
+  snprintf(out, outLen, "%s/flowercare/%s/state", MQTT_BASE_TOPIC, compact);
+}
+
+// Publish HA discovery for all configured Flower Care sensors.
+// Each sensor gets its own device, state topic, and 5 entities.
+static bool publishFlowercareDiscovery(const char* cuveNode) {
+  char availTopic[96];
+  buildAvailabilityTopic(cuveNode, availTopic, sizeof(availTopic));
 
   bool allOk = true;
-  for (size_t i = 0; i < HA_FC_SENSORS_N; ++i) {
-    const HaSensor& s = HA_FC_SENSORS[i];
-    JsonDocument doc;
-    doc["name"] = s.name;
-    char unique[80];
-    snprintf(unique, sizeof(unique), "%s-%s", deviceId, s.key);
-    doc["unique_id"]   = unique;
-    doc["state_topic"] = stateTopic;
-    char valueTpl[48];
-    snprintf(valueTpl, sizeof(valueTpl), "{{ value_json.%s }}", s.key);
-    doc["value_template"] = valueTpl;
-    if (s.deviceClass)    doc["device_class"]        = s.deviceClass;
-    if (s.unit)           doc["unit_of_measurement"] = s.unit;
-    if (s.stateClass)     doc["state_class"]         = s.stateClass;
-    if (s.entityCategory) doc["entity_category"]     = s.entityCategory;
-    doc["availability_topic"]    = availTopic;
-    doc["payload_available"]     = "online";
-    doc["payload_not_available"] = "offline";
-    doc["expire_after"] = (NODE_TIMEOUT_MS / 1000UL) + 30UL;
+  for (uint8_t si = 0; si < g_fcSensorCount; si++) {
+    const FcSensor& fc = g_fcSensors[si];
 
-    JsonObject device = doc["device"].to<JsonObject>();
-    device["identifiers"].add(deviceId);
-    device["name"]         = HA_FLOWERCARE_DEVICE_NAME;
-    device["model"]        = "HHCC JCY01HHCC";
-    device["manufacturer"] = "HHCC Plant Technology Co. Ltd";
+    // Device ID: jardin-flowercare-AABBCC (last 3 bytes, uppercase, no colons)
+    char shortId[7] = "";
+    {
+      const char* p = fc.mac + 9;  // points to "DD:EE:FF" segment
+      size_t ci = 0;
+      for (; *p && ci < 6; p++) {
+        if (*p != ':') shortId[ci++] = (char)toupper((unsigned char)*p);
+      }
+      shortId[ci] = '\0';
+    }
+    char deviceId[64];
+    snprintf(deviceId, sizeof(deviceId), "%s-flowercare-%s", MQTT_BASE_TOPIC, shortId);
 
-    char topic[160];
-    snprintf(topic, sizeof(topic), "%s/sensor/%s/%s/config",
-             HA_DISCOVERY_PREFIX, deviceId, s.key);
-    char buf[512];
-    size_t n = serializeJson(doc, buf, sizeof(buf));
-    bool ok = mqtt.publish(topic, reinterpret_cast<const uint8_t*>(buf), n, true);
-    if (!ok) allOk = false;
-    Serial.printf("[gateway] HA flowercare %s len=%u ok=%d\n",
-                  topic, static_cast<unsigned>(n), ok);
+    char stateTopic[96];
+    buildFcStateTopic(fc.mac, stateTopic, sizeof(stateTopic));
+
+    char deviceName[40];
+    if (fc.name[0]) {
+      snprintf(deviceName, sizeof(deviceName), "%s %s",
+               HA_FLOWERCARE_DEVICE_NAME, fc.name);
+    } else {
+      snprintf(deviceName, sizeof(deviceName), "%s %s",
+               HA_FLOWERCARE_DEVICE_NAME, shortId);
+    }
+
+    for (size_t i = 0; i < HA_FC_SENSORS_N; ++i) {
+      const HaSensor& s = HA_FC_SENSORS[i];
+      JsonDocument doc;
+      doc["name"] = s.name;
+      char unique[80];
+      snprintf(unique, sizeof(unique), "%s-%s", deviceId, s.key);
+      doc["unique_id"]   = unique;
+      doc["state_topic"] = stateTopic;
+      char valueTpl[48];
+      snprintf(valueTpl, sizeof(valueTpl), "{{ value_json.%s }}", s.key);
+      doc["value_template"] = valueTpl;
+      if (s.deviceClass)    doc["device_class"]        = s.deviceClass;
+      if (s.unit)           doc["unit_of_measurement"] = s.unit;
+      if (s.stateClass)     doc["state_class"]         = s.stateClass;
+      if (s.entityCategory) doc["entity_category"]     = s.entityCategory;
+      doc["availability_topic"]    = availTopic;
+      doc["payload_available"]     = "online";
+      doc["payload_not_available"] = "offline";
+      doc["expire_after"] = (NODE_TIMEOUT_MS / 1000UL) + 30UL;
+
+      JsonObject device = doc["device"].to<JsonObject>();
+      device["identifiers"].add(deviceId);
+      device["name"]         = deviceName;
+      device["model"]        = "HHCC JCY01HHCC";
+      device["manufacturer"] = "HHCC Plant Technology Co. Ltd";
+
+      char topic[160];
+      snprintf(topic, sizeof(topic), "%s/sensor/%s/%s/config",
+               HA_DISCOVERY_PREFIX, deviceId, s.key);
+      char buf[768];
+      size_t n = serializeJson(doc, buf, sizeof(buf));
+      bool ok = mqtt.publish(topic, reinterpret_cast<const uint8_t*>(buf), n, true);
+      if (!ok) allOk = false;
+      Serial.printf("[gateway] HA flowercare %s len=%u ok=%d\n",
+                    topic, static_cast<unsigned>(n), ok);
+    }
   }
   return allOk;
 }
@@ -631,7 +688,93 @@ static void publishPowerOnState() {
   mqtt.publish(topic, g_powerOnBehavior, true);
 }
 
+static void saveFcSensors() {
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (uint8_t i = 0; i < g_fcSensorCount; i++) {
+    JsonObject obj = arr.add<JsonObject>();
+    obj["m"] = g_fcSensors[i].mac;
+    obj["n"] = g_fcSensors[i].name;
+  }
+  char buf[300];
+  serializeJson(doc, buf, sizeof(buf));
+  Preferences p;
+  p.begin("gw-fc", false);
+  p.putString("sensors", buf);
+  p.end();
+  Serial.printf("[gateway] FC sensors saved: count=%u\n",
+                static_cast<unsigned>(g_fcSensorCount));
+}
+
+static void loadFcSensors() {
+  char buf[300] = "";
+  Preferences p;
+  p.begin("gw-fc", true);
+  p.getString("sensors", buf, sizeof(buf));
+  p.end();
+
+  g_fcSensorCount = 0;
+  if (buf[0] == '\0') return;
+  JsonDocument doc;
+  if (deserializeJson(doc, buf) != DeserializationError::Ok) return;
+  if (!doc.is<JsonArray>()) return;
+  for (JsonVariant item : doc.as<JsonArray>()) {
+    if (g_fcSensorCount >= FC_MAX_SENSORS) break;
+    const char* m = item["m"] | "";
+    if (strlen(m) != 17) continue;
+    strncpy(g_fcSensors[g_fcSensorCount].mac, m, 17);
+    g_fcSensors[g_fcSensorCount].mac[17] = '\0';
+    const char* n = item["n"] | "";
+    strncpy(g_fcSensors[g_fcSensorCount].name, n, 16);
+    g_fcSensors[g_fcSensorCount].name[16] = '\0';
+    g_fcSensorCount++;
+  }
+  Serial.printf("[gateway] FC sensors loaded: count=%u\n",
+                static_cast<unsigned>(g_fcSensorCount));
+}
+
 static void mqttCallback(char* topic, byte* payload, unsigned int len) {
+  // flowercare_sensors payload is a JSON array — handle before the small-buffer path.
+  {
+    char fctopic[64];
+    buildConfigTopic("flowercare_sensors", fctopic, sizeof(fctopic));
+    if (strcmp(topic, fctopic) == 0) {
+      if (len == 0 || len > 512) return;
+      char jbuf[513];
+      memcpy(jbuf, payload, len);
+      jbuf[len] = '\0';
+      JsonDocument jdoc;
+      if (deserializeJson(jdoc, jbuf) != DeserializationError::Ok) {
+        Serial.printf("[gateway] flowercare_sensors: JSON parse error\n");
+        return;
+      }
+      if (!jdoc.is<JsonArray>()) return;
+      FcSensor newSensors[FC_MAX_SENSORS];
+      uint8_t newCount = 0;
+      for (JsonVariant item : jdoc.as<JsonArray>()) {
+        if (newCount >= FC_MAX_SENSORS) break;
+        const char* m = item["mac"] | "";
+        const char* n = item["name"] | "";
+        if (strlen(m) != 17) continue;
+        strncpy(newSensors[newCount].mac, m, 17);
+        newSensors[newCount].mac[17] = '\0';
+        strncpy(newSensors[newCount].name, n, 16);
+        newSensors[newCount].name[16] = '\0';
+        newCount++;
+      }
+      if (newCount != g_fcSensorCount ||
+          memcmp(newSensors, g_fcSensors, newCount * sizeof(FcSensor)) != 0) {
+        g_fcSensorCount = newCount;
+        memcpy(g_fcSensors, newSensors, newCount * sizeof(FcSensor));
+        saveFcSensors();
+        Serial.printf("[gateway] flowercare_sensors updated: count=%u\n",
+                      static_cast<unsigned>(g_fcSensorCount));
+        publishFlowercareDiscovery("cuve");
+      }
+      return;
+    }
+  }
+
   char buf[16];
   if (len == 0 || len >= sizeof(buf)) return;
   memcpy(buf, payload, len);
@@ -777,7 +920,9 @@ static void oledRender() {
   bool mqttUp = mqtt.connected();
   bool blink  = (now / 500) % 2;  // 1 Hz toggle, matches OLED_REFRESH_MS
   uint32_t ageSec  = lastRxMs ? (now - lastRxMs) / 1000 : 0;
-  bool cuveStale   = lastRxMs && (ageSec > (uint32_t)g_cuveTxIntervalS * 2);
+  uint32_t staleThreshS = (uint32_t)g_cuveTxIntervalS * 2;
+  if (staleThreshS < 30) staleThreshS = 30;
+  bool cuveStale   = lastRxMs && (ageSec > staleThreshS);
 
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x10_tf);
@@ -834,28 +979,45 @@ static void oledRender() {
     oled.drawStr(48, 56, r2 > 0 ? "ON" : (r2 < 0 ? "--" : "OF"));
   }
 
-  // --- Sol (Flower Care) ---
-  if (!isnan(lastSoilTempC)) {
-    char buf[20];
-    snprintf(buf, sizeof(buf), "Sol %.1f\xb0""C", lastSoilTempC);
-    oled.drawStr(0, 72, buf);
-    snprintf(buf, sizeof(buf), "Hum %u%%", (unsigned)lastSoilMoisture);
-    oled.drawStr(0, 84, buf);
+  // --- Sol (Flower Care) --- cycling through configured sensors
+  if (g_fcSensorCount > 0) {
+    // Cycle through configured sensors (not just received data)
+    if (g_fcSensorCount > 1 && (now - g_fcPageMs) >= 5000) {
+      g_fcPage = (g_fcPage + 1) % g_fcSensorCount;
+      g_fcPageMs = now;
+    }
+    uint8_t pi = g_fcPage % g_fcSensorCount;
+    bool hasFc = (pi < lastFcCount && lastFc[pi].valid);
 
+    // Line 1: sensor name + page indicator (always shown when configured)
     {
-      char buf[16];
-      if (lastSoilLux >= 1000) snprintf(buf, sizeof(buf), "%.1f klx", lastSoilLux / 1000.0f);
-      else                     snprintf(buf, sizeof(buf), "%lu lux", (unsigned long)lastSoilLux);
-      oled.drawStr(0, 96, buf);
+      char line1[24];
+      const char* name = g_fcSensors[pi].name[0] ? g_fcSensors[pi].name : "FC";
+      snprintf(line1, sizeof(line1), "%.8s", name);
+      oled.drawStr(0, 72, line1);
     }
-    {
-      char buf[14];
-      snprintf(buf, sizeof(buf), "%d uS/cm", (int)lastSoilCond);
-      oled.drawStr(0, 108, buf);
+
+    if (hasFc) {
+      const OledFcEntry& e = lastFc[pi];
+      {
+        char buf[18];
+        snprintf(buf, sizeof(buf), "%.1f\xb0""C  %u%%",
+                 e.soilTempC, (unsigned)e.soilMoisture);
+        oled.drawStr(0, 82, buf);
+      }
+      {
+        char buf[14];
+        if (e.soilLux >= 1000) snprintf(buf, sizeof(buf), "%.1f klx", e.soilLux / 1000.0f);
+        else                   snprintf(buf, sizeof(buf), "%lu lux", (unsigned long)e.soilLux);
+        oled.drawStr(0, 94, buf);
+      }
+      {
+        char buf[14];
+        snprintf(buf, sizeof(buf), "%d uS/cm", (int)e.soilCond);
+        oled.drawStr(0, 106, buf);
+      }
     }
-  } else {
-    oled.drawStr(0, 72, "Sol: ---");
-  }
+  } // g_fcSensorCount > 0
 
   // --- Footer: age (blinks if stale) + vbat (blinks if low) ---
   if (lastRxMs == 0) {
@@ -878,20 +1040,35 @@ static void oledRender() {
   oled.sendBuffer();
 }
 
-static void oledRecordRx(const JsonDocument& doc, int rssi, float snr) {
+static void oledRecordRx(JsonDocument& doc, int rssi, float snr) {
   const char* node = doc["node"] | "";
   lastNodeName    = node;
-  lastTankCm      = doc["tank_cm"].isNull()       ? NAN : doc["tank_cm"].as<float>();
-  lastWaterTempC  = doc["water_temp_c"].isNull()  ? NAN : doc["water_temp_c"].as<float>();
-  lastTankPct     = doc["tank_pct"].isNull()      ? -1  : doc["tank_pct"].as<int>();
-  lastVbat        = doc["vbat"].isNull()           ? NAN : doc["vbat"].as<float>();
-  lastSoilTempC   = doc["soil_temp_c"].isNull()   ? NAN : doc["soil_temp_c"].as<float>();
-  lastSoilMoisture = doc["soil_moisture"].isNull() ? 0  : doc["soil_moisture"].as<uint8_t>();
-  lastSoilLux     = doc["soil_light"].isNull()    ? 0   : doc["soil_light"].as<uint32_t>();
-  lastSoilCond    = doc["soil_cond"].isNull()     ? 0   : doc["soil_cond"].as<int16_t>();
+  lastTankCm      = doc["tank_cm"].isNull()      ? NAN : doc["tank_cm"].as<float>();
+  lastWaterTempC  = doc["water_temp_c"].isNull() ? NAN : doc["water_temp_c"].as<float>();
+  lastTankPct     = doc["tank_pct"].isNull()     ? -1  : doc["tank_pct"].as<int>();
+  lastVbat        = doc["vbat"].isNull()          ? NAN : doc["vbat"].as<float>();
   lastRssi = rssi;
   lastSnr  = snr;
   lastRxMs = millis();
+
+  lastFcCount = 0;
+  if (doc["fc"].is<JsonArray>()) {
+    for (JsonVariant v : doc["fc"].as<JsonArray>()) {
+      if (lastFcCount >= FC_MAX_SENSORS) break;
+      OledFcEntry& e = lastFc[lastFcCount++];
+      if (!v.isNull() && v.is<JsonObject>()) {
+        JsonObject obj = v.as<JsonObject>();
+        e.soilTempC    = obj["t"].as<float>();
+        e.soilMoisture = obj["m"].as<uint8_t>();
+        e.soilLux      = obj["l"].as<uint32_t>();
+        e.soilCond     = obj["c"].as<int16_t>();
+        e.valid        = true;
+      } else {
+        e.soilTempC = NAN; e.soilMoisture = 0; e.soilLux = 0; e.soilCond = 0;
+        e.valid     = false;
+      }
+    }
+  }
 }
 #endif // WITH_OLED
 
@@ -948,6 +1125,13 @@ static void publishConfigDiscovery() {
     bool ok = mqtt.publish(topic, reinterpret_cast<const uint8_t*>(buf), n, true);
     Serial.printf("[gateway] HA cfg %s len=%u ok=%d\n",
                   topic, static_cast<unsigned>(n), ok);
+
+    // Publish current value so HA shows it immediately (not "unknown")
+    char valBuf[16];
+    snprintf(valBuf, sizeof(valBuf), "%d", *c.target);
+    buildConfigTopic(c.key, stateTopic, sizeof(stateTopic));
+    mqtt.publish(stateTopic, reinterpret_cast<const uint8_t*>(valBuf),
+                 strlen(valBuf), true);
   }
 }
 
@@ -1118,8 +1302,14 @@ static void sendConfigTo(const char* node, uint32_t ackSeq) {
   cfg["us_retries"]      = g_cuveUsRetries;
   cfg["temp_retries"]    = g_cuveTempRetries;
   cfg["oled_display_ms"] = g_cuveOledDisplayMs;
+  {
+    JsonArray arr = doc["fc_macs"].to<JsonArray>();
+    for (uint8_t i = 0; i < g_fcSensorCount; i++) {
+      arr.add(g_fcSensors[i].mac);
+    }
+  }
 
-  char buf[256];
+  char buf[300];
   size_t n = serializeJson(doc, buf, sizeof(buf));
   n = authAppendMac(buf, n, sizeof(buf),
                     reinterpret_cast<const uint8_t*>(LORA_PSK),
@@ -1127,10 +1317,10 @@ static void sendConfigTo(const char* node, uint32_t ackSeq) {
 
   bool txOk = (loraTx(reinterpret_cast<const uint8_t*>(buf), n) == RADIOLIB_ERR_NONE);
 
-  Serial.printf("[gateway] cfg TX to=%s ack=%u tx_interval_s=%d bytes=%u tx_ok=%d\n",
+  Serial.printf("[gateway] cfg TX to=%s ack=%u tx_interval_s=%d fc_count=%u bytes=%u tx_ok=%d\n",
                 node, static_cast<unsigned>(ackSeq),
-                g_cuveTxIntervalS, static_cast<unsigned>(n),
-                txOk ? 1 : 0);
+                g_cuveTxIntervalS, static_cast<unsigned>(g_fcSensorCount),
+                static_cast<unsigned>(n), txOk ? 1 : 0);
 }
 
 static void publishMeasurement(const char* json, size_t jsonLen, int rssi, float snr) {
@@ -1254,6 +1444,33 @@ static void publishMeasurement(const char* json, size_t jsonLen, int rssi, float
   Serial.printf("[gateway] MQTT %s len=%u ok=%d\n",
                 topic, static_cast<unsigned>(n), ok);
 
+  // Publish per-sensor Flower Care state topics from the fc[] array.
+  if (!isActuator && doc["fc"].is<JsonArray>()) {
+    JsonArray fcArr = doc["fc"].as<JsonArray>();
+    uint8_t idx = 0;
+    for (JsonVariant entry : fcArr) {
+      if (idx >= g_fcSensorCount) break;
+      if (!entry.isNull() && entry.is<JsonObject>()) {
+        JsonObject obj = entry.as<JsonObject>();
+        JsonDocument fcDoc;
+        fcDoc["soil_temp_c"]   = obj["t"];
+        fcDoc["soil_moisture"] = obj["m"];
+        fcDoc["soil_light"]    = obj["l"];
+        fcDoc["soil_cond"]     = obj["c"];
+        fcDoc["soil_bat"]      = obj["b"];
+        char fcTopic[96];
+        buildFcStateTopic(g_fcSensors[idx].mac, fcTopic, sizeof(fcTopic));
+        char fcBuf[128];
+        size_t fn = serializeJson(fcDoc, fcBuf, sizeof(fcBuf));
+        bool fok = mqtt.publish(fcTopic,
+                                reinterpret_cast<const uint8_t*>(fcBuf), fn, true);
+        Serial.printf("[gateway] FC %s len=%u ok=%d\n",
+                      fcTopic, static_cast<unsigned>(fn), fok);
+      }
+      idx++;
+    }
+  }
+
 #if WITH_OLED
   oledRecordRx(doc, rssi, snr);
 #endif
@@ -1268,6 +1485,7 @@ void setup() {
   loadRelayTarget();
   loadCmdSeq();
   loadPowerOnBehavior();
+  loadFcSensors();
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
   Serial.printf("[gateway] band=%lu Hz\n",

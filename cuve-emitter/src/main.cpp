@@ -9,11 +9,13 @@
 #include "wdt.h"
 #include "lora_board.h"
 
-#ifdef FLOWERCARE_MAC
+#ifdef WITH_FLOWERCARE
 #include <NimBLEDevice.h>
 // Arduino 3.x releases BTDM memory in initArduino() unless btInUse() returns
 // true. NimBLE-Arduino 1.4.x doesn't set _btLibraryInUse, so override here.
 extern "C" bool btInUse() { return true; }
+// Hard limit from LoRa packet budget: 3 sensors fill ~225 bytes at most.
+#define FC_MAX_SENSORS 3
 #endif
 
 #ifndef DEBUG_US
@@ -136,7 +138,7 @@ extern "C" bool btInUse() { return true; }
 #define TEMP_RESOLUTION_BITS 11
 #endif
 
-#ifdef FLOWERCARE_MAC
+#ifdef WITH_FLOWERCARE
 // Timeout for a single BLE connect attempt. Keep short so a missing
 // Flower Care doesn't add more than this many seconds to each wake cycle.
 #ifndef FLOWERCARE_CONNECT_TIMEOUT_S
@@ -154,7 +156,7 @@ static U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, OLED_SCL
 #endif
 static bool oledPresent = false;
 static float oledVbat = NAN;
-#ifdef FLOWERCARE_MAC
+#ifdef WITH_FLOWERCARE
 static float   oledSoilTempC = NAN;
 static int     oledSoilMoist = -1;
 static int32_t oledSoilLight = -1;
@@ -177,6 +179,26 @@ static uint32_t oledDisplayMs = OLED_DISPLAY_MS_DEFAULT;
 static uint8_t  usRetries     = US_RETRIES_DEFAULT;
 static uint8_t  tempRetries   = TEMP_RETRIES_DEFAULT;
 
+#ifdef WITH_FLOWERCARE
+static char    g_fcMacList[FC_MAX_SENSORS][18];
+static uint8_t g_fcMacCount = 0;
+
+static void parseFcMacs(const char* raw) {
+  g_fcMacCount = 0;
+  const char* p = raw;
+  while (*p && g_fcMacCount < FC_MAX_SENSORS) {
+    if (strlen(p) >= 17) {
+      strncpy(g_fcMacList[g_fcMacCount++], p, 17);
+      g_fcMacList[g_fcMacCount - 1][17] = '\0';
+      p += 17;
+      if (*p == ',') p++;
+    } else {
+      break;
+    }
+  }
+}
+#endif
+
 static bool loraReady = false;
 static float lastValidDistanceCm = NAN;
 static uint32_t lastValidDistanceMs = 0;
@@ -193,6 +215,13 @@ static void loadSettings() {
   oledDisplayMs = prefs.getUInt("oled_disp_ms", OLED_DISPLAY_MS_DEFAULT);
   usRetries     = prefs.getUChar("us_retries",   US_RETRIES_DEFAULT);
   tempRetries   = prefs.getUChar("temp_retries", TEMP_RETRIES_DEFAULT);
+#ifdef WITH_FLOWERCARE
+  {
+    char raw[FC_MAX_SENSORS * 18] = "";
+    prefs.getString("fc_macs", raw, sizeof(raw));
+    parseFcMacs(raw);
+  }
+#endif
   prefs.end();
   if (txIntervalS < TX_INTERVAL_S_MIN || txIntervalS > TX_INTERVAL_S_MAX)
     txIntervalS = TX_INTERVAL_S_DEFAULT;
@@ -210,6 +239,9 @@ static void loadSettings() {
                 static_cast<unsigned>(oledDisplayMs),
                 static_cast<unsigned>(usRetries),
                 static_cast<unsigned>(tempRetries));
+#ifdef WITH_FLOWERCARE
+  Serial.printf("[emitter] fc_macs count=%u\n", static_cast<unsigned>(g_fcMacCount));
+#endif
 }
 
 static void saveSettings() {
@@ -219,6 +251,16 @@ static void saveSettings() {
   prefs.putUInt("oled_disp_ms",  oledDisplayMs);
   prefs.putUChar("us_retries",   usRetries);
   prefs.putUChar("temp_retries", tempRetries);
+#ifdef WITH_FLOWERCARE
+  {
+    char raw[FC_MAX_SENSORS * 18] = "";
+    for (uint8_t i = 0; i < g_fcMacCount; i++) {
+      if (i > 0) strncat(raw, ",", sizeof(raw) - strlen(raw) - 1);
+      strncat(raw, g_fcMacList[i], sizeof(raw) - strlen(raw) - 1);
+    }
+    prefs.putString("fc_macs", raw);
+  }
+#endif
   prefs.end();
   Serial.printf("[emitter] settings saved: tx_int=%u boot_dly=%u oled_ms=%u us_ret=%u temp_ret=%u\n",
                 static_cast<unsigned>(txIntervalS),
@@ -273,7 +315,7 @@ static void oledRender(float currentDist, float currentTemp, uint32_t txSeq) {
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x10_tf);
 
-#ifdef FLOWERCARE_MAC
+#ifdef WITH_FLOWERCARE
   // Compact 5-row layout (128x64):
   //   y=9:  CUVE          <interval>
   //   y=34: <24pt dist>          cm
@@ -354,7 +396,7 @@ static void oledRender(float currentDist, float currentTemp, uint32_t txSeq) {
     oled.drawStr(66, 63, "C:--");
   }
 
-#else
+#else // WITH_FLOWERCARE
   // Standard layout: header y=10, big number y=44, footer y=62
   oled.drawStr(0, 10, "CUVE");
   if (!loraReady && blink) {
@@ -481,7 +523,7 @@ static bool tryReceiveConfig(uint32_t reqSeq) {
       continue;
     }
     loraRxFlag = false;
-    char buf[200];
+    char buf[300];
     size_t pktLen = loraReadPacket(buf, sizeof(buf));
     if (pktLen == 0) continue;
     int jsonLen = authVerifyMac(buf, static_cast<int>(pktLen),
@@ -511,6 +553,29 @@ static bool tryReceiveConfig(uint32_t reqSeq) {
                                         tempRetries,    TEMP_RETRIES_MIN,     TEMP_RETRIES_MAX);
     changed |= applyCfgField<uint32_t>(cfg, "oled_display_ms",
                                         oledDisplayMs,  OLED_DISPLAY_MS_MIN,  OLED_DISPLAY_MS_MAX);
+#ifdef WITH_FLOWERCARE
+    if (doc["fc_macs"].is<JsonArray>()) {
+      char newList[FC_MAX_SENSORS][18];
+      uint8_t newCount = 0;
+      for (JsonVariant v : doc["fc_macs"].as<JsonArray>()) {
+        if (newCount >= FC_MAX_SENSORS) break;
+        const char* m = v.as<const char*>();
+        if (m && strlen(m) == 17) {
+          strncpy(newList[newCount], m, 17);
+          newList[newCount][17] = '\0';
+          newCount++;
+        }
+      }
+      if (newCount != g_fcMacCount ||
+          memcmp(newList, g_fcMacList, newCount * 18) != 0) {
+        g_fcMacCount = newCount;
+        memcpy(g_fcMacList, newList, newCount * 18);
+        Serial.printf("[emitter] fc_macs updated count=%u\n",
+                      static_cast<unsigned>(g_fcMacCount));
+        changed = true;
+      }
+    }
+#endif
     if (changed) saveSettings();
     Serial.printf("[emitter] cfg ACK seq=%u\n", static_cast<unsigned>(reqSeq));
     return true;
@@ -520,7 +585,7 @@ static bool tryReceiveConfig(uint32_t reqSeq) {
   return false;
 }
 
-#ifdef FLOWERCARE_MAC
+#ifdef WITH_FLOWERCARE
 struct FlowerCareData {
   float    soilTempC;
   uint8_t  soilMoisture;
@@ -530,7 +595,7 @@ struct FlowerCareData {
   bool     valid;
 };
 
-static FlowerCareData readFlowerCare() {
+static FlowerCareData readFlowerCare(const char* mac) {
   FlowerCareData out = {NAN, 0, 0, 0, 0, false};
   NimBLEClient* client = NimBLEDevice::createClient();
   if (!client) {
@@ -538,8 +603,8 @@ static FlowerCareData readFlowerCare() {
     return out;
   }
   client->setConnectTimeout(FLOWERCARE_CONNECT_TIMEOUT_S);
-  if (!client->connect(NimBLEAddress(FLOWERCARE_MAC, 0))) {
-    Serial.println("[emitter] FlowerCare: connect failed");
+  if (!client->connect(NimBLEAddress(mac, 0))) {
+    Serial.printf("[emitter] FlowerCare: connect failed mac=%s\n", mac);
     NimBLEDevice::deleteClient(client);
     return out;
   }
@@ -573,8 +638,8 @@ static FlowerCareData readFlowerCare() {
       if (!b.empty()) out.battery = (uint8_t)b[0];
     }
     out.valid = true;
-    Serial.printf("[emitter] FlowerCare T:%.1f H:%u L:%lu C:%d BAT:%u\n",
-      out.soilTempC, (unsigned)out.soilMoisture, (unsigned long)out.lightLux,
+    Serial.printf("[emitter] FlowerCare mac=%s T:%.1f H:%u L:%lu C:%d BAT:%u\n",
+      mac, out.soilTempC, (unsigned)out.soilMoisture, (unsigned long)out.lightLux,
       (int)out.conductivity, (unsigned)out.battery);
   } while (false);
 
@@ -582,7 +647,7 @@ static FlowerCareData readFlowerCare() {
   NimBLEDevice::deleteClient(client);
   return out;
 }
-#endif // FLOWERCARE_MAC
+#endif // WITH_FLOWERCARE
 
 static void sendSample() {
   float dist = readDistanceCm();
@@ -591,8 +656,14 @@ static void sendSample() {
     lastValidDistanceMs = millis();
   }
   float waterTemp = readWaterTempC();
-#ifdef FLOWERCARE_MAC
-  FlowerCareData fc = readFlowerCare();
+#ifdef WITH_FLOWERCARE
+  FlowerCareData fcResults[FC_MAX_SENSORS];
+  for (uint8_t i = 0; i < g_fcMacCount; i++) {
+    fcResults[i] = readFlowerCare(g_fcMacList[i]);
+  }
+  for (uint8_t i = g_fcMacCount; i < FC_MAX_SENSORS; i++) {
+    fcResults[i] = {NAN, 0, 0, 0, 0, false};
+  }
 #endif
   float vbat = readVbatVolts();
   uint32_t s = rtcSeq++;
@@ -607,32 +678,38 @@ static void sendSample() {
   if (isnan(dist)) {
     doc["tank_cm"] = nullptr;
   } else {
-    doc["tank_cm"] = roundf(dist * 10.0f) / 10.0f;
+    doc["tank_cm"] = serialized(String(dist, 1));
   }
   if (isnan(waterTemp)) {
     doc["water_temp_c"] = nullptr;
   } else {
-    doc["water_temp_c"] = roundf(waterTemp * 10.0f) / 10.0f;
+    doc["water_temp_c"] = serialized(String(waterTemp, 1));
   }
-  doc["vbat"] = roundf(vbat * 100.0f) / 100.0f;
-#ifdef FLOWERCARE_MAC
-  if (fc.valid) {
-    doc["soil_temp_c"]   = roundf(fc.soilTempC * 10.0f) / 10.0f;
-    doc["soil_moisture"] = fc.soilMoisture;
-    doc["soil_light"]    = fc.lightLux;
-    doc["soil_cond"]     = fc.conductivity;
-    doc["soil_bat"]      = fc.battery;
-  } else {
-    doc["soil_temp_c"]   = nullptr;
-    doc["soil_moisture"] = nullptr;
-    doc["soil_light"]    = nullptr;
-    doc["soil_cond"]     = nullptr;
-    doc["soil_bat"]      = nullptr;
+  doc["vbat"] = serialized(String(vbat, 2));
+#ifdef WITH_FLOWERCARE
+  if (g_fcMacCount > 0) {
+    JsonArray fcArr = doc["fc"].to<JsonArray>();
+    for (uint8_t i = 0; i < g_fcMacCount; i++) {
+      const FlowerCareData& r = fcResults[i];
+      if (r.valid) {
+        JsonObject entry = fcArr.add<JsonObject>();
+        entry["t"] = serialized(String(r.soilTempC, 1));
+        entry["m"] = r.soilMoisture;
+        entry["l"] = r.lightLux;
+        entry["c"] = r.conductivity;
+        entry["b"] = r.battery;
+      } else {
+        fcArr.add(nullptr);
+      }
+    }
   }
 #endif
   if (wantCfg) doc["cfg_req"] = 1;
 
-  char buf[256];
+  // 300 bytes: JSON headroom (with 3 FC sensors ~225 bytes) + 17-byte HMAC.
+  // LoRa SX1276 max payload is 255; loraTx returns ERR_PACKET_TOO_LONG if
+  // exceeded, which is caught by txOk below.
+  char buf[300];
   size_t n = serializeJson(doc, buf, sizeof(buf));
   n = authAppendMac(buf, n, sizeof(buf),
                     reinterpret_cast<const uint8_t*>(LORA_PSK),
@@ -663,11 +740,17 @@ static void sendSample() {
 
 #if WITH_OLED
   oledVbat = vbat;
-#ifdef FLOWERCARE_MAC
-  oledSoilTempC = fc.valid ? fc.soilTempC        : NAN;
-  oledSoilMoist = fc.valid ? (int)fc.soilMoisture : -1;
-  oledSoilLight = fc.valid ? (int32_t)fc.lightLux : -1;
-  oledSoilCond  = fc.valid ? (int)fc.conductivity  : -1;
+#ifdef WITH_FLOWERCARE
+  oledSoilTempC = NAN; oledSoilMoist = -1; oledSoilLight = -1; oledSoilCond = -1;
+  for (uint8_t i = 0; i < g_fcMacCount; i++) {
+    if (fcResults[i].valid) {
+      oledSoilTempC = fcResults[i].soilTempC;
+      oledSoilMoist = (int)fcResults[i].soilMoisture;
+      oledSoilLight = (int32_t)fcResults[i].lightLux;
+      oledSoilCond  = (int)fcResults[i].conductivity;
+      break;
+    }
+  }
 #endif
   oledRender(dist, waterTemp, s);
 #endif
@@ -687,7 +770,7 @@ static void enterDeepSleep() {
   // Park the SX1276 in STDBY before yanking power: empties FIFOs and avoids
   // a half-finished TX leaking into the next boot's first packet.
   if (loraReady) loraRadio.sleep();
-#ifdef FLOWERCARE_MAC
+#ifdef WITH_FLOWERCARE
   NimBLEDevice::deinit(true);
 #endif
   esp_sleep_enable_timer_wakeup(us);
@@ -727,7 +810,7 @@ void setup() {
 #endif
 
   tempInit();
-#ifdef FLOWERCARE_MAC
+#ifdef WITH_FLOWERCARE
   NimBLEDevice::init("");
 #endif
   loraInit();
