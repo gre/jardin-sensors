@@ -89,9 +89,8 @@
 #ifndef RELAY_BATCH_WINDOW_MS
 #define RELAY_BATCH_WINDOW_MS 50UL
 #endif
-// Debounce for "null = full tank": an isolated null in a valid stream is
-// replaced by the last known value while it is recent. A null sustained
-// longer truly switches to 100%.
+// Grace window for isolated null tank_cm readings: substitute the last known
+// value to avoid flickering tank_pct on brief sensor glitches.
 #ifndef TANK_NULL_GRACE_MS
 #define TANK_NULL_GRACE_MS 3000UL
 #endif
@@ -99,10 +98,10 @@
 // Gateway-side calibration. Defaults at boot, overridden at runtime by HA
 // via MQTT (topics jardin/config/tank_*_cm) with range 0..TANK_DISTANCE_MAX_CM.
 #ifndef TANK_EMPTY_DISTANCE_CM
-#define TANK_EMPTY_DISTANCE_CM 80
+#define TANK_EMPTY_DISTANCE_CM 100
 #endif
 #ifndef TANK_FULL_DISTANCE_CM
-#define TANK_FULL_DISTANCE_CM 5
+#define TANK_FULL_DISTANCE_CM 0
 #endif
 #ifndef TANK_DISTANCE_MAX_CM
 #define TANK_DISTANCE_MAX_CM 200
@@ -114,7 +113,7 @@ static_assert(TANK_EMPTY_DISTANCE_CM > TANK_FULL_DISTANCE_CM,
 // Bounds enforced when an emitter receives this value. Must match
 // cuve-emitter's TX_INTERVAL_S_{MIN,MAX}.
 #ifndef CUVE_TX_INTERVAL_S_DEFAULT
-#define CUVE_TX_INTERVAL_S_DEFAULT 60
+#define CUVE_TX_INTERVAL_S_DEFAULT 180
 #endif
 #ifndef CUVE_TX_INTERVAL_S_MIN
 #define CUVE_TX_INTERVAL_S_MIN 5
@@ -135,26 +134,37 @@ static_assert(TANK_EMPTY_DISTANCE_CM > TANK_FULL_DISTANCE_CM,
 #define CUVE_BOOT_DELAY_MS_MAX 5000
 #endif
 
-// Ultrasonic read attempts. Must match cuve-emitter's US_RETRIES_{MIN,MAX}.
+// Ultrasonic extra retries (0 = single attempt). Must match cuve-emitter's US_RETRIES_{MIN,MAX}.
 #ifndef CUVE_US_RETRIES_DEFAULT
-#define CUVE_US_RETRIES_DEFAULT 3
+#define CUVE_US_RETRIES_DEFAULT 2
 #endif
 #ifndef CUVE_US_RETRIES_MIN
-#define CUVE_US_RETRIES_MIN 1
+#define CUVE_US_RETRIES_MIN 0
 #endif
 #ifndef CUVE_US_RETRIES_MAX
 #define CUVE_US_RETRIES_MAX 10
 #endif
 
-// DS18B20 conversion attempts. Must match cuve-emitter's TEMP_RETRIES_{MIN,MAX}.
+// DS18B20 extra retries (0 = single attempt). Must match cuve-emitter's TEMP_RETRIES_{MIN,MAX}.
 #ifndef CUVE_TEMP_RETRIES_DEFAULT
-#define CUVE_TEMP_RETRIES_DEFAULT 2
+#define CUVE_TEMP_RETRIES_DEFAULT 0
 #endif
 #ifndef CUVE_TEMP_RETRIES_MIN
-#define CUVE_TEMP_RETRIES_MIN 1
+#define CUVE_TEMP_RETRIES_MIN 0
 #endif
 #ifndef CUVE_TEMP_RETRIES_MAX
 #define CUVE_TEMP_RETRIES_MAX 5
+#endif
+
+// BLE scan period: scan every N TX cycles (1 = every cycle). Must match FC_SCAN_EVERY_{MIN,MAX}.
+#ifndef CUVE_FC_SCAN_EVERY_DEFAULT
+#define CUVE_FC_SCAN_EVERY_DEFAULT 5
+#endif
+#ifndef CUVE_FC_SCAN_EVERY_MIN
+#define CUVE_FC_SCAN_EVERY_MIN 1
+#endif
+#ifndef CUVE_FC_SCAN_EVERY_MAX
+#define CUVE_FC_SCAN_EVERY_MAX 60
 #endif
 
 // OLED display duration on the emitter after each wake. Must match cuve-emitter's OLED_DISPLAY_MS_{MIN,MAX}.
@@ -187,6 +197,7 @@ static int g_cuveBootDelayMs   = CUVE_BOOT_DELAY_MS_DEFAULT;
 static int g_cuveUsRetries     = CUVE_US_RETRIES_DEFAULT;
 static int g_cuveTempRetries   = CUVE_TEMP_RETRIES_DEFAULT;
 static int g_cuveOledDisplayMs = CUVE_OLED_DISPLAY_MS_DEFAULT;
+static int g_cuveFcScanEvery   = CUVE_FC_SCAN_EVERY_DEFAULT;
 
 #ifndef ACTUATOR_NODE_ID
 #define ACTUATOR_NODE_ID "prises"
@@ -399,6 +410,8 @@ static const GwConfig GW_CONFIG[] = {
    CUVE_TEMP_RETRIES_MIN,    CUVE_TEMP_RETRIES_MAX,    &g_cuveTempRetries},
   {"cuve_oled_display_ms", "Cuve OLED display",      "ms",
    CUVE_OLED_DISPLAY_MS_MIN, CUVE_OLED_DISPLAY_MS_MAX, &g_cuveOledDisplayMs},
+  {"cuve_fc_scan_every",   "Cuve BLE scan every N TX", "",
+   CUVE_FC_SCAN_EVERY_MIN,   CUVE_FC_SCAN_EVERY_MAX,   &g_cuveFcScanEvery},
 };
 constexpr size_t GW_CONFIG_N = sizeof(GW_CONFIG) / sizeof(GW_CONFIG[0]);
 
@@ -1271,8 +1284,7 @@ static void augmentDerived(JsonDocument& doc, NodeState& st) {
   } else if (!isnan(st.lastValidTankCm) &&
              (now - st.lastValidTankCmMs) < TANK_NULL_GRACE_MS) {
     // Isolated null in a valid stream: substitute the last known measurement
-    // to avoid flicker to 100%. If the null persists past the grace window,
-    // we fall back to the "null = full tank" case below.
+    // to avoid flickering tank_pct on brief sensor glitches.
     doc["tank_cm"] = st.lastValidTankCm;
   }
 
@@ -1280,10 +1292,8 @@ static void augmentDerived(JsonDocument& doc, NodeState& st) {
     doc["vbat_low"] = doc["vbat"].as<float>() < VBAT_LOW_V ? 1 : 0;
 
   if (g_tankEmptyCm == g_tankFullCm) return;
-  // tank_cm null = surface within the sensor dead zone (~25 cm) = tank
-  // considered full. This is intentional: the sensor is mounted at the top,
-  // a full tank puts the surface below the lowest measurable distance.
-  int distCm = doc["tank_cm"].isNull() ? 0 : doc["tank_cm"].as<int>();
+  if (doc["tank_cm"].isNull()) return;
+  int distCm = doc["tank_cm"].as<int>();
   long pct = map(distCm, g_tankEmptyCm, g_tankFullCm, 0, 100);
   doc["tank_pct"] = constrain(pct, 0L, 100L);
 }
@@ -1302,6 +1312,7 @@ static void sendConfigTo(const char* node, uint32_t ackSeq) {
   cfg["us_retries"]      = g_cuveUsRetries;
   cfg["temp_retries"]    = g_cuveTempRetries;
   cfg["oled_display_ms"] = g_cuveOledDisplayMs;
+  cfg["fc_scan_every"]   = g_cuveFcScanEvery;
   {
     JsonArray arr = doc["fc_macs"].to<JsonArray>();
     for (uint8_t i = 0; i < g_fcSensorCount; i++) {

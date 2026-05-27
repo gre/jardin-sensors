@@ -11,6 +11,12 @@
 
 #ifdef WITH_FLOWERCARE
 #include <NimBLEDevice.h>
+// Arduino 3.x releases BT memory in initArduino() unless _btLibraryInUse is true.
+// NimBLE-Arduino 1.4.x sets it only during NimBLEDevice::init(), which is too late.
+// A global initializer runs before initArduino(), so we set the flag here.
+// This avoids redefining btInUse() (which is now a strong symbol in Arduino 3.x).
+extern "C" bool _btLibraryInUse;
+static const bool _btReserved = (_btLibraryInUse = true);
 // Hard limit from LoRa packet budget: 3 sensors fill ~225 bytes at most.
 #define FC_MAX_SENSORS 3
 #endif
@@ -60,23 +66,23 @@
 #define BOOT_DELAY_MS_MAX 5000
 #endif
 
-// Ultrasonic read attempts per cycle. Configurable from HA.
+// Ultrasonic extra retries per cycle (0 = single attempt). Configurable from HA.
 #ifndef US_RETRIES_DEFAULT
-#define US_RETRIES_DEFAULT 3
+#define US_RETRIES_DEFAULT 2
 #endif
 #ifndef US_RETRIES_MIN
-#define US_RETRIES_MIN 1
+#define US_RETRIES_MIN 0
 #endif
 #ifndef US_RETRIES_MAX
 #define US_RETRIES_MAX 10
 #endif
 
-// DS18B20 conversion attempts per cycle. Configurable from HA.
+// DS18B20 extra retries per cycle (0 = single attempt). Configurable from HA.
 #ifndef TEMP_RETRIES_DEFAULT
-#define TEMP_RETRIES_DEFAULT 2
+#define TEMP_RETRIES_DEFAULT 0
 #endif
 #ifndef TEMP_RETRIES_MIN
-#define TEMP_RETRIES_MIN 1
+#define TEMP_RETRIES_MIN 0
 #endif
 #ifndef TEMP_RETRIES_MAX
 #define TEMP_RETRIES_MAX 5
@@ -139,7 +145,18 @@
 // Timeout for a single BLE connect attempt. Keep short so a missing
 // Flower Care doesn't add more than this many seconds to each wake cycle.
 #ifndef FLOWERCARE_CONNECT_TIMEOUT_S
-#define FLOWERCARE_CONNECT_TIMEOUT_S 5
+#define FLOWERCARE_CONNECT_TIMEOUT_S 3
+#endif
+// BLE scan is skipped every (fc_scan_every - 1) out of fc_scan_every TX cycles.
+// 1 = scan every cycle; 3 = scan every 3rd cycle (saves ~2/3 of BLE power).
+#ifndef FC_SCAN_EVERY_DEFAULT
+#define FC_SCAN_EVERY_DEFAULT 5
+#endif
+#ifndef FC_SCAN_EVERY_MIN
+#define FC_SCAN_EVERY_MIN 1
+#endif
+#ifndef FC_SCAN_EVERY_MAX
+#define FC_SCAN_EVERY_MAX 60
 #endif
 #endif
 
@@ -168,6 +185,10 @@ RTC_DATA_ATTR static uint32_t rtcSeq = 0;
 // Initialized > CFG_REFRESH_S so the very first packet after power-up carries
 // cfg_req=1 and the emitter pulls fresh settings.
 RTC_DATA_ATTR static uint32_t rtcCfgAccumS = 0xFFFFFFFFu;
+#ifdef WITH_FLOWERCARE
+// Counts TX cycles; BLE is only active when (rtcFcCycle % g_fcScanEvery == 0).
+RTC_DATA_ATTR static uint16_t rtcFcCycle = 0;
+#endif
 
 static Preferences prefs;
 static uint32_t txIntervalS   = TX_INTERVAL_S_DEFAULT;
@@ -178,7 +199,9 @@ static uint8_t  tempRetries   = TEMP_RETRIES_DEFAULT;
 
 #ifdef WITH_FLOWERCARE
 static char    g_fcMacList[FC_MAX_SENSORS][18];
-static uint8_t g_fcMacCount = 0;
+static uint8_t g_fcMacCount   = 0;
+static uint8_t g_fcScanEvery  = FC_SCAN_EVERY_DEFAULT;
+static bool    g_doFcScan     = false;
 
 static void parseFcMacs(const char* raw) {
   g_fcMacCount = 0;
@@ -213,6 +236,7 @@ static void loadSettings() {
   usRetries     = prefs.getUChar("us_retries",   US_RETRIES_DEFAULT);
   tempRetries   = prefs.getUChar("temp_retries", TEMP_RETRIES_DEFAULT);
 #ifdef WITH_FLOWERCARE
+  g_fcScanEvery = prefs.getUChar("fc_scan_every", FC_SCAN_EVERY_DEFAULT);
   {
     char raw[FC_MAX_SENSORS * 18] = "";
     prefs.getString("fc_macs", raw, sizeof(raw));
@@ -226,10 +250,14 @@ static void loadSettings() {
     bootDelayMs = BOOT_DELAY_MS_DEFAULT;
   if (oledDisplayMs > OLED_DISPLAY_MS_MAX)
     oledDisplayMs = OLED_DISPLAY_MS_DEFAULT;
-  if (usRetries < US_RETRIES_MIN || usRetries > US_RETRIES_MAX)
+  if (usRetries > US_RETRIES_MAX)
     usRetries = US_RETRIES_DEFAULT;
-  if (tempRetries < TEMP_RETRIES_MIN || tempRetries > TEMP_RETRIES_MAX)
+  if (tempRetries > TEMP_RETRIES_MAX)
     tempRetries = TEMP_RETRIES_DEFAULT;
+#ifdef WITH_FLOWERCARE
+  if (g_fcScanEvery < FC_SCAN_EVERY_MIN || g_fcScanEvery > FC_SCAN_EVERY_MAX)
+    g_fcScanEvery = FC_SCAN_EVERY_DEFAULT;
+#endif
   Serial.printf("[emitter] settings loaded: tx_int=%u boot_dly=%u oled_ms=%u us_ret=%u temp_ret=%u\n",
                 static_cast<unsigned>(txIntervalS),
                 static_cast<unsigned>(bootDelayMs),
@@ -249,6 +277,7 @@ static void saveSettings() {
   prefs.putUChar("us_retries",   usRetries);
   prefs.putUChar("temp_retries", tempRetries);
 #ifdef WITH_FLOWERCARE
+  prefs.putUChar("fc_scan_every", g_fcScanEvery);
   {
     char raw[FC_MAX_SENSORS * 18] = "";
     for (uint8_t i = 0; i < g_fcMacCount; i++) {
@@ -448,7 +477,7 @@ static void sensorInit() {
 }
 
 static float readDistanceCm() {
-  for (int attempt = 0; attempt < usRetries; attempt++) {
+  for (int attempt = 0; attempt <= usRetries; attempt++) {
     if (attempt > 0) delay(20);
     digitalWrite(US_TRIG_PIN, LOW);
     delayMicroseconds(2);
@@ -485,7 +514,7 @@ static float readWaterTempC() {
   // Retry loop catches the 85 °C power-on sentinel and DEVICE_DISCONNECTED
   // transients on the first read after a deep-sleep wake. Each attempt blocks
   // for the remainder of the 11-bit conversion window (~375 ms).
-  for (int attempt = 0; attempt < tempRetries; attempt++) {
+  for (int attempt = 0; attempt <= tempRetries; attempt++) {
     uint32_t elapsed = millis() - tempRequestMs;
     if (elapsed < 400) delay(400 - elapsed);
     float t = tempSensor.getTempCByIndex(0);
@@ -551,6 +580,8 @@ static bool tryReceiveConfig(uint32_t reqSeq) {
     changed |= applyCfgField<uint32_t>(cfg, "oled_display_ms",
                                         oledDisplayMs,  OLED_DISPLAY_MS_MIN,  OLED_DISPLAY_MS_MAX);
 #ifdef WITH_FLOWERCARE
+    changed |= applyCfgField<uint8_t> (cfg, "fc_scan_every",
+                                        g_fcScanEvery,  FC_SCAN_EVERY_MIN,   FC_SCAN_EVERY_MAX);
     if (doc["fc_macs"].is<JsonArray>()) {
       char newList[FC_MAX_SENSORS][18];
       uint8_t newCount = 0;
@@ -567,6 +598,7 @@ static bool tryReceiveConfig(uint32_t reqSeq) {
           memcmp(newList, g_fcMacList, newCount * 18) != 0) {
         g_fcMacCount = newCount;
         memcpy(g_fcMacList, newList, newCount * 18);
+        rtcFcCycle = 0;
         Serial.printf("[emitter] fc_macs updated count=%u\n",
                       static_cast<unsigned>(g_fcMacCount));
         changed = true;
@@ -655,11 +687,11 @@ static void sendSample() {
   float waterTemp = readWaterTempC();
 #ifdef WITH_FLOWERCARE
   FlowerCareData fcResults[FC_MAX_SENSORS];
-  for (uint8_t i = 0; i < g_fcMacCount; i++) {
-    fcResults[i] = readFlowerCare(g_fcMacList[i]);
-  }
-  for (uint8_t i = g_fcMacCount; i < FC_MAX_SENSORS; i++) {
-    fcResults[i] = {NAN, 0, 0, 0, 0, false};
+  for (uint8_t i = 0; i < FC_MAX_SENSORS; i++) fcResults[i] = {NAN, 0, 0, 0, 0, false};
+  if (g_doFcScan) {
+    for (uint8_t i = 0; i < g_fcMacCount; i++) {
+      fcResults[i] = readFlowerCare(g_fcMacList[i]);
+    }
   }
 #endif
   float vbat = readVbatVolts();
@@ -684,7 +716,7 @@ static void sendSample() {
   }
   doc["vbat"] = serialized(String(vbat, 2));
 #ifdef WITH_FLOWERCARE
-  if (g_fcMacCount > 0) {
+  if (g_doFcScan && g_fcMacCount > 0) {
     JsonArray fcArr = doc["fc"].to<JsonArray>();
     for (uint8_t i = 0; i < g_fcMacCount; i++) {
       const FlowerCareData& r = fcResults[i];
@@ -739,13 +771,15 @@ static void sendSample() {
   oledVbat = vbat;
 #ifdef WITH_FLOWERCARE
   oledSoilTempC = NAN; oledSoilMoist = -1; oledSoilLight = -1; oledSoilCond = -1;
-  for (uint8_t i = 0; i < g_fcMacCount; i++) {
-    if (fcResults[i].valid) {
-      oledSoilTempC = fcResults[i].soilTempC;
-      oledSoilMoist = (int)fcResults[i].soilMoisture;
-      oledSoilLight = (int32_t)fcResults[i].lightLux;
-      oledSoilCond  = (int)fcResults[i].conductivity;
-      break;
+  if (g_doFcScan) {
+    for (uint8_t i = 0; i < g_fcMacCount; i++) {
+      if (fcResults[i].valid) {
+        oledSoilTempC = fcResults[i].soilTempC;
+        oledSoilMoist = (int)fcResults[i].soilMoisture;
+        oledSoilLight = (int32_t)fcResults[i].lightLux;
+        oledSoilCond  = (int)fcResults[i].conductivity;
+        break;
+      }
     }
   }
 #endif
@@ -768,7 +802,7 @@ static void enterDeepSleep() {
   // a half-finished TX leaking into the next boot's first packet.
   if (loraReady) loraRadio.sleep();
 #ifdef WITH_FLOWERCARE
-  NimBLEDevice::deinit(true);
+  if (g_doFcScan) NimBLEDevice::deinit(true);
 #endif
   esp_sleep_enable_timer_wakeup(us);
   esp_deep_sleep_start();
@@ -796,6 +830,7 @@ void setup() {
 #ifdef DEBUG_US
   Serial.println("[debug] US continuous mode — reading every 100ms");
   while (true) {
+    watchdogFeed();
     float d = readDistanceCm();
     if (isnan(d)) Serial.println("[US] ---");
     else          Serial.printf("[US] %.1f cm\n", d);
@@ -808,7 +843,9 @@ void setup() {
 
   tempInit();
 #ifdef WITH_FLOWERCARE
-  NimBLEDevice::init("");
+  g_doFcScan = (g_fcMacCount > 0) && (rtcFcCycle % g_fcScanEvery == 0);
+  rtcFcCycle++;
+  if (g_doFcScan) NimBLEDevice::init("");
 #endif
   loraInit();
 #if WITH_OLED

@@ -11,8 +11,8 @@ Connected garden, LoRa point-to-point + Home Assistant via MQTT.
   (emitter), one in the house (gateway). No hardware difference between the
   two roles.
 - **Sensors on emitter side**:
-  - HC-SR04 waterproof variant. TRIG -> GPIO4, ECHO -> 10k+20k divider -> GPIO25
-    (ECHO is 5V, divider mandatory). VCC 5V.
+  - HC-SR04 waterproof variant. TRIG -> GPIO4, ECHO -> GPIO25 (direct, no
+    divider). VCC 5V.
   - DS18B20 stainless steel waterproof probe 5m, 1-Wire, factory-calibrated.
     4.7k pull-up required between DATA and VDD.
 - **LILYGO T3 V1.6.1 OLED quirk**: do not software-pulse GPIO 16 (OLED_RST).
@@ -131,17 +131,17 @@ already output the SI quantity without deployment calibration. So the
 emitter can send the final value directly (`water_temp_c`). The "raw vs
 derived" rule only applies when there is deployment-specific math.
 
-## "null = full tank" rule
+## tank_cm null handling
 
-The ultrasonic sensor is mounted at the very top of the tank. When it is
-nearly full, the water surface goes below the SR04M-2 dead zone (~25 cm) =>
-no echo => `tank_cm: null`. The gateway interprets `null` as `0 cm` =
-**100% full** in `augmentDerived`. Consequence: `tank_pct` is always defined
-when the node is online; only the offline-availability (3 min without
-packet) makes `tank_pct` go unavailable.
+`tank_cm: null` means the ultrasonic read failed (no echo, sensor not ready,
+or low voltage). `augmentDerived` does not compute `tank_pct` for a null
+reading; the value stays at its last retained MQTT value. A 3-second grace
+window substitutes the previous valid reading for brief isolated glitches to
+avoid flickering. Sustained nulls leave `tank_pct` stale until the next valid
+read.
 
-Do not confuse `tank_cm: null` (tank full) with `availability: offline`
-(emitter completely lost).
+`tank_pct` goes truly unavailable only when the emitter goes offline
+(no packet for 3 min, controlled by `availability` topic).
 
 ## Conventions
 
