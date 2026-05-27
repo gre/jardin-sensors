@@ -515,8 +515,6 @@ static bool publishFlowercareDiscovery(const char* cuveNode) {
       doc["availability_topic"]    = availTopic;
       doc["payload_available"]     = "online";
       doc["payload_not_available"] = "offline";
-      doc["expire_after"] = (NODE_TIMEOUT_MS / 1000UL) + 30UL;
-
       JsonObject device = doc["device"].to<JsonObject>();
       device["identifiers"].add(deviceId);
       device["name"]         = deviceName;
@@ -746,6 +744,10 @@ static void loadFcSensors() {
                 static_cast<unsigned>(g_fcSensorCount));
 }
 
+#if WITH_OLED
+static void oledRecordRx(JsonDocument& doc, int rssi, float snr);
+#endif
+
 static void mqttCallback(char* topic, byte* payload, unsigned int len) {
   // flowercare_sensors payload is a JSON array — handle before the small-buffer path.
   {
@@ -787,6 +789,28 @@ static void mqttCallback(char* topic, byte* payload, unsigned int len) {
       return;
     }
   }
+
+#if WITH_OLED
+  // Recover OLED state from retained cuve/state at boot (large payload, must precede small-buf check).
+  {
+    char cuveStateTopic[96];
+    buildStateTopic("cuve", cuveStateTopic, sizeof(cuveStateTopic));
+    if (strcmp(topic, cuveStateTopic) == 0) {
+      if (len > 0 && len < 512) {
+        char jbuf[513];
+        memcpy(jbuf, payload, len);
+        jbuf[len] = '\0';
+        JsonDocument jdoc;
+        if (deserializeJson(jdoc, jbuf) == DeserializationError::Ok) {
+          int   rssi = jdoc["rssi"] | 0;
+          float snr  = jdoc["snr"]  | 0.0f;
+          oledRecordRx(jdoc, rssi, snr);
+        }
+      }
+      return;
+    }
+  }
+#endif
 
   char buf[16];
   if (len == 0 || len >= sizeof(buf)) return;
@@ -926,16 +950,28 @@ static void oledInvert(uint8_t x, uint8_t y, uint8_t w, const char* str) {
   oled.setDrawColor(1);
 }
 
+// Horizontal divider with centered label: draws a line across the full width,
+// then clears a box behind the label text so it reads through the line.
+static void oledSection(uint8_t y, const char* label) {
+  oled.setFont(u8g2_font_6x10_tf);
+  uint8_t w  = oled.getStrWidth(label);
+  uint8_t x0 = (64 - w) / 2;
+  oled.drawHLine(0, y - 5, 64);
+  oled.setDrawColor(0);
+  oled.drawBox(x0 - 1, y - 8, w + 2, 10);
+  oled.setDrawColor(1);
+  oled.drawStr(x0, y, label);
+}
+
 static void oledRender() {
   if (!oledPresent) return;
   uint32_t now = millis();
-  bool wifiUp = (WiFi.status() == WL_CONNECTED);
   bool mqttUp = mqtt.connected();
-  bool blink  = (now / 500) % 2;  // 1 Hz toggle, matches OLED_REFRESH_MS
+  bool blink  = (now / 500) % 2;
   uint32_t ageSec  = lastRxMs ? (now - lastRxMs) / 1000 : 0;
   uint32_t staleThreshS = (uint32_t)g_cuveTxIntervalS * 2;
   if (staleThreshS < 30) staleThreshS = 30;
-  bool cuveStale   = lastRxMs && (ageSec > staleThreshS);
+  bool cuveStale = lastRxMs && (ageSec > staleThreshS);
 
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x10_tf);
@@ -943,111 +979,103 @@ static void oledRender() {
   // --- Header ---
   oled.drawStr(0, 10, "JARDIN");
   oled.setFont(u8g2_font_open_iconic_all_1x_t);
-  // Home icon (0xB8 = "B8" in browser): HA/MQTT connection.
   if (mqttUp) {
     oled.drawGlyph(40, 10, 0xB8);
   } else if (blink) {
-    oled.drawGlyph(40, 10, 0x118);  // warning ("18") when MQTT down
+    oled.drawGlyph(40, 10, 0x118);
   }
-  // Cuve icon (0x119 = "19" in browser): data received from cuve node.
   bool cuveHeard = lastRxMs > 0;
-  if (cuveHeard && !cuveStale) {
+  if (cuveHeard && (!cuveStale || blink)) {
     oled.drawGlyph(52, 10, 0x119);
-  } else if (cuveHeard && cuveStale && blink) {
-    oled.drawGlyph(52, 10, 0x119);  // blink = stale
   }
   oled.setFont(u8g2_font_6x10_tf);
 
-  // --- Cuve ---
+  // --- Cuve: section header + big % left, water temp right ---
+  oledSection(26, "Cuve");
   if (!cuveStale || blink) {
-    char buf[12];
-    if (lastTankPct >= 0) snprintf(buf, sizeof(buf), "Cuve  %d%%", lastTankPct);
-    else                  snprintf(buf, sizeof(buf), "Cuve  ---");
-    oled.drawStr(0, 28, buf);
+    if (lastTankPct >= 0) {
+      char num[8];
+      snprintf(num, sizeof(num), "%d", lastTankPct);
+      oled.setFont(u8g2_font_logisoso24_tn);
+      uint8_t numW = oled.getStrWidth(num);
+      oled.drawStr(0, 52, num);
+      oled.setFont(u8g2_font_6x10_tf);
+      oled.drawStr(numW + 1, 52, "%");
+      oled.setFont(u8g2_font_6x10_tf);
+    }
   }
   if (!isnan(lastWaterTempC)) {
-    char buf[16];
-    snprintf(buf, sizeof(buf), "Eau %.1f\xb0""C", lastWaterTempC);
-    oled.drawStr(0, 40, buf);
+    char tbuf[10];
+    snprintf(tbuf, sizeof(tbuf), "%.1f\xb0""C", lastWaterTempC);
+    uint8_t tw = oled.getStrWidth(tbuf);
+    oled.drawStr(64 - tw, 52, tbuf);
   }
 
-  // --- Prises: P1 / P2 with inverted "ON", blink if actuator offline ---
-  NodeState* act = findNode(ACTUATOR_NODE_ID);
-  bool prisesOnline = act && act->online;
-  if (!prisesOnline) {
-    if (blink) {
-      oled.setFont(u8g2_font_open_iconic_all_1x_t);
-      oled.drawGlyph(0, 56, 0x57);   // ban = disabled ("57" in browser)
-      oled.setFont(u8g2_font_6x10_tf);
-      oled.drawStr(12, 56, "prises");
-    }
-  } else {
-    int r1 = g_relay1Desired >= 0 ? g_relay1Desired : g_relay1Actual;
-    int r2 = g_relay2Desired >= 0 ? g_relay2Desired : g_relay2Actual;
-    // P1 (left half): label inverted when ON, state text beside it
-    if (r1 > 0) { oledInvert(0, 56, 14, "P1"); } else { oled.drawStr(0, 56, "P1"); }
-    oled.drawStr(16, 56, r1 > 0 ? "ON" : (r1 < 0 ? "--" : "OF"));
-    // P2 (right half, x=32)
-    if (r2 > 0) { oledInvert(32, 56, 14, "P2"); } else { oled.drawStr(32, 56, "P2"); }
-    oled.drawStr(48, 56, r2 > 0 ? "ON" : (r2 < 0 ? "--" : "OF"));
-  }
-
-  // --- Sol (Flower Care) --- cycling through configured sensors
-  if (g_fcSensorCount > 0) {
-    // Cycle through configured sensors (not just received data)
-    if (g_fcSensorCount > 1 && (now - g_fcPageMs) >= 5000) {
-      g_fcPage = (g_fcPage + 1) % g_fcSensorCount;
-      g_fcPageMs = now;
-    }
-    uint8_t pi = g_fcPage % g_fcSensorCount;
-    bool hasFc = (pi < lastFcCount && lastFc[pi].valid);
-
-    // Line 1: sensor name + page indicator (always shown when configured)
-    {
-      char line1[24];
-      const char* name = g_fcSensors[pi].name[0] ? g_fcSensors[pi].name : "FC";
-      snprintf(line1, sizeof(line1), "%.8s", name);
-      oled.drawStr(0, 72, line1);
-    }
-
-    if (hasFc) {
-      const OledFcEntry& e = lastFc[pi];
-      {
-        char buf[18];
-        snprintf(buf, sizeof(buf), "%.1f\xb0""C  %u%%",
-                 e.soilTempC, (unsigned)e.soilMoisture);
-        oled.drawStr(0, 82, buf);
-      }
-      {
-        char buf[14];
-        if (e.soilLux >= 1000) snprintf(buf, sizeof(buf), "%.1f klx", e.soilLux / 1000.0f);
-        else                   snprintf(buf, sizeof(buf), "%lu lux", (unsigned long)e.soilLux);
-        oled.drawStr(0, 94, buf);
-      }
-      {
-        char buf[14];
-        snprintf(buf, sizeof(buf), "%d uS/cm", (int)e.soilCond);
-        oled.drawStr(0, 106, buf);
-      }
-    }
-  } // g_fcSensorCount > 0
-
-  // --- Footer: age (blinks if stale) + vbat (blinks if low) ---
+  // --- Cuve status: age + vbat in small font, right below cuve data ---
+  oled.setFont(u8g2_font_5x8_tf);
   if (lastRxMs == 0) {
-    if (blink) oled.drawStr(0, 124, "Connexion");
+    if (blink) oled.drawStr(0, 62, "Connexion");
   } else if (!cuveStale || blink) {
     char buf[10];
     if (ageSec < 3600) snprintf(buf, sizeof(buf), "%lus", (unsigned long)ageSec);
     else               snprintf(buf, sizeof(buf), "%lum", (unsigned long)(ageSec / 60));
-    oled.drawStr(0, 124, buf);
+    oled.drawStr(0, 62, buf);
   }
   if (!isnan(lastVbat)) {
     bool vbatLow = lastVbat < 4.0f;
     if (!vbatLow || blink) {
       char buf[8];
       snprintf(buf, sizeof(buf), "%.2fV", lastVbat);
-      oled.drawStr(32, 124, buf);
+      uint8_t vw = oled.getStrWidth(buf);
+      oled.drawStr(64 - vw, 62, buf);
     }
+  }
+  oled.setFont(u8g2_font_6x10_tf);
+
+  // --- Flower Care: section header + data ---
+  if (g_fcSensorCount > 0) {
+    if (g_fcSensorCount > 1 && (now - g_fcPageMs) >= 5000) {
+      g_fcPage = (g_fcPage + 1) % g_fcSensorCount;
+      g_fcPageMs = now;
+    }
+    uint8_t pi = g_fcPage % g_fcSensorCount;
+    bool hasFc = (pi < lastFcCount && lastFc[pi].valid);
+    const char* fcName = g_fcSensors[pi].name[0] ? g_fcSensors[pi].name : "FC";
+    oledSection(80, fcName);
+
+    if (hasFc) {
+      const OledFcEntry& e = lastFc[pi];
+      {
+        char buf[18];
+        snprintf(buf, sizeof(buf), "%.1f\xb0""C %u%%",
+                 e.soilTempC, (unsigned)e.soilMoisture);
+        oled.drawStr(0, 91, buf);
+      }
+      {
+        char buf[14];
+        snprintf(buf, sizeof(buf), "%d uS/cm", (int)e.soilCond);
+        oled.drawStr(0, 101, buf);
+      }
+    }
+  }
+
+  // --- Footer: prises ---
+  NodeState* act = findNode(ACTUATOR_NODE_ID);
+  bool prisesOnline = act && act->online;
+  if (!prisesOnline) {
+    if (blink) {
+      oled.setFont(u8g2_font_open_iconic_all_1x_t);
+      oled.drawGlyph(0, 122, 0x57);
+      oled.setFont(u8g2_font_6x10_tf);
+      oled.drawStr(12, 122, "prises");
+    }
+  } else {
+    int r1 = g_relay1Desired >= 0 ? g_relay1Desired : g_relay1Actual;
+    int r2 = g_relay2Desired >= 0 ? g_relay2Desired : g_relay2Actual;
+    if (r1 > 0) { oledInvert(0, 122, 14, "P1"); } else { oled.drawStr(0, 122, "P1"); }
+    oled.drawStr(16, 122, r1 > 0 ? "ON" : (r1 < 0 ? "--" : "OF"));
+    if (r2 > 0) { oledInvert(32, 122, 14, "P2"); } else { oled.drawStr(32, 122, "P2"); }
+    oled.drawStr(48, 122, r2 > 0 ? "ON" : (r2 < 0 ? "--" : "OF"));
   }
 
   oled.sendBuffer();
@@ -1064,8 +1092,8 @@ static void oledRecordRx(JsonDocument& doc, int rssi, float snr) {
   lastSnr  = snr;
   lastRxMs = millis();
 
-  lastFcCount = 0;
   if (doc["fc"].is<JsonArray>()) {
+    lastFcCount = 0;
     for (JsonVariant v : doc["fc"].as<JsonArray>()) {
       if (lastFcCount >= FC_MAX_SENSORS) break;
       OledFcEntry& e = lastFc[lastFcCount++];
@@ -1251,6 +1279,13 @@ static void mqttEnsureConnected() {
     snprintf(sub, sizeof(sub), "%s/config/+", MQTT_BASE_TOPIC);
     mqtt.subscribe(sub);
     mqtt.subscribe(MQTT_BASE_TOPIC "/" ACTUATOR_NODE_ID "/+/set");
+#if WITH_OLED
+    {
+      char cuveStateSub[96];
+      buildStateTopic("cuve", cuveStateSub, sizeof(cuveStateSub));
+      mqtt.subscribe(cuveStateSub);
+    }
+#endif
     publishConfigDiscovery();
     publishPowerOnState();
     // Re-publish discovery + availability for nodes already seen this session
