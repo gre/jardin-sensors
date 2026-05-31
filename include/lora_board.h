@@ -49,7 +49,11 @@ static inline int16_t loraBegin() {
   // the time NRST releases. SPI.begin() only configures SCK/MISO/MOSI; NSS
   // (software CS) must be explicitly driven HIGH before the reset pulse, or
   // the SX1261 may receive garbage SPI frames during the NRST recovery window.
+#ifdef LORA_SCK
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI);
+#else
   SPI.begin();
+#endif
   pinMode(LORA_SS, OUTPUT);
   digitalWrite(LORA_SS, HIGH);
 #ifdef LORA_BUSY
@@ -64,13 +68,13 @@ static inline int16_t loraBegin() {
   digitalWrite(LORA_RST, HIGH);
   delay(500);
 #endif
-  // PA15 (LORA_RST) is NOT wired to SX1261 NRST on the DX-LR30; the RST pulse
-  // above is a no-op for the chip. Disable RadioLib's internal RST so it doesn't
-  // issue its own 1ms pulse against an open pin.
+#if RADIOLIB_GODMODE
+  // DX-LR30 specific: PA15 is not wired to SX1262 NRST, disable RadioLib RST.
   loraModule.rstPin = RADIOLIB_NC;
-  // PA14 doubles as DIO3 on the DX-LR30 and goes HIGH during TX, which would
-  // block SPI if RadioLib polls it as BUSY. Keep NC for all operations.
+  // DX-LR30 specific: PA14=BUSY doubles as DIO3, goes HIGH in TX mode and would
+  // block SPI. Switch to NC after init so RadioLib stops polling it.
   loraModule.gpioPin = RADIOLIB_NC;
+#endif
 #else
   loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
 #endif

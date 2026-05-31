@@ -990,44 +990,49 @@ static void oledRender() {
   }
   oled.setFont(u8g2_font_6x10_tf);
 
-  // --- Cuve: section header + big % left, water temp right ---
+  // --- Cuve: section header + big % left, right column (temp/vbat/age) ---
   oledSection(26, "Cuve");
-  if (!cuveStale || blink) {
-    if (lastTankPct >= 0) {
-      char num[8];
-      snprintf(num, sizeof(num), "%d", lastTankPct);
-      oled.setFont(u8g2_font_logisoso24_tn);
-      uint8_t numW = oled.getStrWidth(num);
-      oled.drawStr(0, 52, num);
-      oled.setFont(u8g2_font_6x10_tf);
-      oled.drawStr(numW + 1, 52, "%");
-      oled.setFont(u8g2_font_6x10_tf);
-    }
-  }
+
+  // Right column: three right-aligned values spanning the big number height
+  oled.setFont(u8g2_font_5x8_tf);
   if (!isnan(lastWaterTempC)) {
     char tbuf[10];
     snprintf(tbuf, sizeof(tbuf), "%.1f\xb0""C", lastWaterTempC);
     uint8_t tw = oled.getStrWidth(tbuf);
-    oled.drawStr(64 - tw, 52, tbuf);
-  }
-
-  // --- Cuve status: age + vbat in small font, right below cuve data ---
-  oled.setFont(u8g2_font_5x8_tf);
-  if (lastRxMs == 0) {
-    if (blink) oled.drawStr(0, 62, "Connexion");
-  } else if (!cuveStale || blink) {
-    char buf[10];
-    if (ageSec < 3600) snprintf(buf, sizeof(buf), "%lus", (unsigned long)ageSec);
-    else               snprintf(buf, sizeof(buf), "%lum", (unsigned long)(ageSec / 60));
-    oled.drawStr(0, 62, buf);
+    oled.drawStr(64 - tw, 42, tbuf);
   }
   if (!isnan(lastVbat)) {
     bool vbatLow = lastVbat < 4.0f;
     if (!vbatLow || blink) {
-      char buf[8];
-      snprintf(buf, sizeof(buf), "%.2fV", lastVbat);
-      uint8_t vw = oled.getStrWidth(buf);
-      oled.drawStr(64 - vw, 62, buf);
+      char vbuf[8];
+      snprintf(vbuf, sizeof(vbuf), "%.2fV", lastVbat);
+      uint8_t vw = oled.getStrWidth(vbuf);
+      oled.drawStr(64 - vw, 52, vbuf);
+    }
+  }
+  if (lastRxMs == 0) {
+    if (blink) {
+      uint8_t cw = oled.getStrWidth("conn");
+      oled.drawStr(64 - cw, 62, "conn");
+    }
+  } else if (!cuveStale || blink) {
+    char abuf[10];
+    if (ageSec < 3600) snprintf(abuf, sizeof(abuf), "%lus", (unsigned long)ageSec);
+    else               snprintf(abuf, sizeof(abuf), "%lum", (unsigned long)(ageSec / 60));
+    uint8_t aw = oled.getStrWidth(abuf);
+    oled.drawStr(64 - aw, 62, abuf);
+  }
+
+  // Left: big % with baseline on the third column line
+  if (!cuveStale || blink) {
+    if (lastTankPct >= 0) {
+      char num[8];
+      snprintf(num, sizeof(num), "%d", lastTankPct);
+      oled.setFont(u8g2_font_logisoso28_tn);
+      uint8_t numW = oled.getStrWidth(num);
+      oled.drawStr(0, 62, num);
+      oled.setFont(u8g2_font_6x10_tf);
+      oled.drawStr(numW + 1, 48, "%");
     }
   }
   oled.setFont(u8g2_font_6x10_tf);
@@ -1518,7 +1523,7 @@ static void publishMeasurement(const char* json, size_t jsonLen, int rssi, float
   }
 
 #if WITH_OLED
-  oledRecordRx(doc, rssi, snr);
+  if (!isActuator) oledRecordRx(doc, rssi, snr);
 #endif
 }
 
